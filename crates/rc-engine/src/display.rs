@@ -7,16 +7,17 @@
 //! frame itself.
 //!
 //! **Aspect.** The PS2 drew 512×416 and the TV showed it at 4:3; the frame is 4:3 ([`Aspect::Original`], the
-//! default), 16:10 ([`Aspect::Wide16x10`], a MacBook's screen) or 16:9 ([`Aspect::Wide16x9`]). The game's 512×416
-//! screen (the HUD, the menus, the item canvases) always maps onto the frame's centred 4:3 box ([`ui_box`]: the whole
-//! frame at 4:3) and the 3D view widens around it: the world cameras' horizontal tangent is the game's ×6/5 at 16:10,
-//! ×4/3 at 16:9 ([`hor_scale`], Hor+: the vertical view is the game's).
+//! default), 16:10 ([`Aspect::Wide16x10`], a MacBook's screen), 16:9 ([`Aspect::Wide16x9`]) or 21:9
+//! ([`Aspect::UltraWide21x9`], an ultrawide monitor). The game's 512×416 screen (the HUD, the menus, the item
+//! canvases) always maps onto the frame's centred 4:3 box ([`ui_box`]: the whole frame at 4:3) and the 3D view widens
+//! around it: the world cameras' horizontal tangent is the game's ×6/5 at 16:10, ×4/3 at 16:9, ×7/4 at 21:9
+//! ([`hor_scale`], Hor+: the vertical view is the game's).
 //!
 //! **Settings** ([`DisplaySettings`], the Port Options page; persisted in the port settings file,
 //! `crate::render_settings::save_key`): the aspect, the render resolution — "Window" (the largest frame of the aspect
 //! that fits the window, in physical pixels) or a frame of a fixed height (416p, the PS2's lines, or 720p / 1080p /
 //! 1440p / 2160p; the width follows the aspect) scaled to the window — and fullscreen (borderless on the current
-//! monitor). `RC_ASPECT=4:3|16:10|16:9`, `RC_RESOLUTION=window|416|720|1080|1440|2160` and
+//! monitor). `RC_ASPECT=4:3|16:10|16:9|21:9`, `RC_RESOLUTION=window|416|720|1080|1440|2160` and
 //! `RC_FULLSCREEN=0|1` override the file at start; F11 toggles fullscreen and saves it.
 //!
 //! The frame's format is the window's swap-chain format (`Bgra8UnormSrgb`), so every pipeline is specialised as it
@@ -44,17 +45,18 @@ pub struct GameFrame {
     pub size: UVec2,
 }
 
-/// The frame's shape: the TV's 4:3, or a wide screen's 16:10 / 16:9 (the Port Options row's order).
+/// The frame's shape: the TV's 4:3, or a wide screen's 16:10 / 16:9 / 21:9 (the Port Options row's order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aspect {
     Original,
     Wide16x10,
     Wide16x9,
+    UltraWide21x9,
 }
 
 impl Aspect {
     /// The Port Options row's values, in order.
-    pub const ALL: [Aspect; 3] = [Aspect::Original, Aspect::Wide16x10, Aspect::Wide16x9];
+    pub const ALL: [Aspect; 4] = [Aspect::Original, Aspect::Wide16x10, Aspect::Wide16x9, Aspect::UltraWide21x9];
     pub fn index(self) -> u8 { Self::ALL.iter().position(|&a| a == self).unwrap_or(0) as u8 }
     pub fn from_index(i: u8) -> Self { Self::ALL.get(i as usize).copied().unwrap_or(Aspect::Original) }
     /// Width / height.
@@ -63,6 +65,7 @@ impl Aspect {
             Aspect::Original => 4.0 / 3.0,
             Aspect::Wide16x10 => 16.0 / 10.0,
             Aspect::Wide16x9 => 16.0 / 9.0,
+            Aspect::UltraWide21x9 => 21.0 / 9.0,
         }
     }
     fn parse(v: &str) -> Option<Self> { Self::ALL.into_iter().find(|a| a.key() == v.trim()) }
@@ -71,16 +74,18 @@ impl Aspect {
             Aspect::Original => "4:3",
             Aspect::Wide16x10 => "16:10",
             Aspect::Wide16x9 => "16:9",
+            Aspect::UltraWide21x9 => "21:9",
         }
     }
 }
 
-/// The factor on the game camera's horizontal tangent (0.63) for `aspect`: 1 at 4:3, 6/5 at 16:10, 4/3 at 16:9 (the
-/// frame is that much wider at the same height, and the view keeps the TV's proportions).
+/// The factor on the game camera's horizontal tangent (0.63) for `aspect`: 1 at 4:3, 6/5 at 16:10, 4/3 at 16:9, 7/4 at
+/// 21:9 (the frame is that much wider at the same height, and the view keeps the TV's proportions).
 pub fn hor_scale(aspect: Aspect) -> f32 { aspect.ratio() / Aspect::Original.ratio() }
 
-/// The game pixels the frame extends past the 512-wide game screen on each side (0 at 4:3, 51 at 16:10, 85 at 16:9): the HUD's
-/// layer is that much wider (crate::hud_render), its left / right slots move out by it (`rc_game::hud`).
+/// The game pixels the frame extends past the 512-wide game screen on each side (0 at 4:3, 51 at 16:10, 85 at 16:9,
+/// 192 at 21:9): the HUD's layer is that much wider (crate::hud_render), its left / right slots move out by it
+/// (`rc_game::hud`).
 pub fn side_extra(aspect: Aspect) -> i32 { ((SCREEN_W * hor_scale(aspect) - SCREEN_W) * 0.5).round() as i32 }
 
 /// The render resolution: fit to the window, or a fixed frame height (the width follows the aspect): the PS2's 416
@@ -382,12 +387,15 @@ mod tests {
         assert_eq!(frame_size(Resolution::Height(1080), Aspect::Wide16x10, UVec2::new(300, 300)), UVec2::new(1728, 1080));
         assert_eq!(frame_size(Resolution::Height(1080), w, UVec2::new(300, 300)), UVec2::new(1920, 1080));
         assert_eq!(frame_size(Resolution::Window, Aspect::Wide16x10, UVec2::new(3024, 1890)), UVec2::new(3024, 1890));
+        assert_eq!(frame_size(Resolution::Height(1080), Aspect::UltraWide21x9, UVec2::new(300, 300)), UVec2::new(2520, 1080));
         assert_eq!(side_extra(Aspect::Wide16x10), 51);
+        assert_eq!(side_extra(Aspect::UltraWide21x9), 192);
         assert_eq!(Resolution::parse("720"), Some(Resolution::Height(720)));
         assert_eq!(ui_box(UVec2::new(2560, 1440)), (Vec2::new(320.0, 0.0), Vec2::new(1920.0, 1440.0)));
         assert_eq!(ui_box(UVec2::new(1024, 768)), (Vec2::ZERO, Vec2::new(1024.0, 768.0)));
         assert_eq!(hor_scale(o), 1.0);
         assert!((hor_scale(w) - 4.0 / 3.0).abs() < 1e-6);
+        assert!((hor_scale(Aspect::UltraWide21x9) - 7.0 / 4.0).abs() < 1e-6);
         assert_eq!(fit(UVec2::new(1024, 832), Vec2::new(1600.0, 832.0)), Vec2::new(1024.0, 832.0));
         assert_eq!(fit(UVec2::new(1024, 832), Vec2::new(1024.0, 1000.0)), Vec2::new(1024.0, 832.0));
         for r in Resolution::ALL { assert_eq!(Resolution::from_index(r.index()), r); assert_eq!(Resolution::parse(&r.key()), Some(r)); }
