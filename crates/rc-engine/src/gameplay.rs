@@ -1377,6 +1377,8 @@ fn setup(
         svc.counters.bolts = gs.0.global.bolts;
         // 0x15ee20 (the challenge-gated pads 1135 and gold-weapon offers read it) and 0x13e520.
         svc.counters.times_completed = gs.0.global.completes;
+        // RAC2's challenge-mode multiplier follows the running game across planet changes.
+        svc.counters.bolt_multiplier = gs.0.bolt_multiplier;
         svc.counters.gold_weapons = gs.0.global.gold_weapons.to_vec();
         if let Some(l) = gs.0.levels.get(level_index as usize) {
             svc.counters.level_bolts[level_index as usize % 20] = l.bolts;
@@ -2539,6 +2541,9 @@ fn tick(
             }
         }
     }
+    // RAC2's challenge-mode bolt multiplier follows the running game across planet changes (`GameState` keeps it; it
+    // is not saved). Kills step it in the moby loop and hits/deaths reset it just above.
+    if let Some(gs) = state.as_mut() { gs.0.bolt_multiplier = p.svc.counters.bolt_multiplier; }
     if let HeroTick::Unimplemented(s) = report.hero {
         if !std::mem::replace(&mut p.frozen_hint, true) { println!("gameplay: hero frozen in unported state {s:#x}; R respawns"); }
     }
