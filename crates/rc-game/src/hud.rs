@@ -755,12 +755,13 @@ impl HudState {
 
     /// `FUN_0024b090(handle, flags)`: replace the flags of the slot holding `handle`. Handles start at 1 and the empty
     /// slots hold 0, so only a slot holding an element matches (as [`HudState::keep_up`] / [`HudState::release`];
-    /// without the guard a handle 0, none yet, set an empty slot's flags).
-    pub fn set_flags(&mut self, handle: u32, flags: u32) {
-        if let Some(s) = self.slots.iter_mut().find(|s| s.handle == handle && s.last.element != Element::Empty) {
-            s.last.flags = flags;
-            if !s.pending { s.flags = flags; }
-        }
+    /// without the guard a handle 0, none yet, set an empty slot's flags). False when no slot holds `handle` (it was
+    /// re-armed after the caller took it).
+    pub fn set_flags(&mut self, handle: u32, flags: u32) -> bool {
+        let Some(s) = self.slots.iter_mut().find(|s| s.handle == handle && s.last.element != Element::Empty) else { return false };
+        s.last.flags = flags;
+        if !s.pending { s.flags = flags; }
+        true
     }
 
     /// `apply_pending_animation` + the element's init.
@@ -999,20 +1000,29 @@ impl HudState {
         self.inputs = inputs;
         self.sounds.clear();
         self.vsync = self.vsync.wrapping_add(1);
+        // The vendor's bolt counter (OpenVendorMenu: slot 2 | 0x10; VendorExit: flags 0). Before the callers: a
+        // pickup on the vendor's exit tick re-queues slot 2, and the release must clear the pin's flags on the slot
+        // the pin still holds (the re-queue would replace its request and handle).
+        match (self.bolts_pinned, self.bolts_pin_handle) {
+            (true, None) => self.bolts_pin_handle = Some(self.queue(0x12, icon::BOLT_SLOT, Element::Bolts, 9_999_999)),
+            (false, Some(h)) => {
+                // The pin is slot 2 (`OpenVendorMenu`'s `0x12`). A pickup queued before this release (its call
+                // reaches the HUD before the tick) re-arms the slot and replaces the pin's handle; clear the flags
+                // on whichever request slot 2 holds now.
+                if !self.set_flags(h, 0) {
+                    let s = &mut self.slots[2];
+                    s.last.flags = 0;
+                    s.flags = 0;
+                }
+                self.bolts_pin_handle = None;
+            }
+            _ => {}
+        }
         self.frame_calls();
         // PromptTick 0x278eb8's slot part (and NpcTalkUpdate's): slot 12 requested, or kept up for 10 ticks.
         if self.prompt_show {
             let h = self.queue_req(Request::PROMPT);
             self.keep_up(h, scale_ticks(10));
-        }
-        // The vendor's bolt counter (OpenVendorMenu: slot 2 | 0x10; VendorExit: flags 0).
-        match (self.bolts_pinned, self.bolts_pin_handle) {
-            (true, None) => self.bolts_pin_handle = Some(self.queue(0x12, icon::BOLT_SLOT, Element::Bolts, 9_999_999)),
-            (false, Some(h)) => {
-                self.set_flags(h, 0);
-                self.bolts_pin_handle = None;
-            }
-            _ => {}
         }
         self.update_slots();
         let mut out = Vec::new();
@@ -1039,7 +1049,11 @@ impl HudState {
         let delta = self.last.and_then(|(_, bolts)| (i.bolts != bolts).then(|| i.bolts - bolts));
         if let Some((hp, bolts)) = self.last {
             if i.hp < hp { self.queue_req(Request::HEALTH); }
-            if i.bolts != bolts { self.queue_req(Request::BOLTS); }
+            // The counter's callers (`CollectBolt` 0x2a7e10, …) re-arm it on a change, but not while the vendor
+            // pins slot 2 (`OpenVendorMenu`): a request there would replace the pin's request and handle, so
+            // `VendorExit`'s `FUN_0024b090(handle, 0)` would no longer find the slot and flag 0x10 would keep the
+            // counter up forever.
+            if i.bolts != bolts && !self.bolts_pinned { self.queue_req(Request::BOLTS); }
         }
         if self.last.is_none() { self.bolt_recent.displayed = i.bolts; }
         self.last = Some((i.hp, i.bolts));
@@ -2303,6 +2317,30 @@ mod tests {
             _ => None,
         });
         assert_eq!(recent, Some((EMPTY_TO, b"-5".to_vec())));
+    }
+
+    /// A spend at the vendor does not re-arm the counter (only `CollectBolt` does), so the vendor's pin handle stays
+    /// valid: its exit clears flag 0x10 and the counter hides once the total has rolled up, even when a pickup
+    /// arrives on the exit tick.
+    #[test]
+    fn bolt_counter_hides_after_a_vendor_spend() {
+        let mut h = HudState::new(assets());
+        for _ in 0..30 { h.tick(inputs(4, 100)); }
+        // The vendor opens: mode 5, slot 2 pinned.
+        h.bolts_pinned = true;
+        for _ in 0..30 { h.tick(Inputs { mode: 5, ..inputs(4, 100) }); }
+        assert_eq!((h.slots[2].slide, h.slots[2].flags), (8, 0x10));
+        // Buying snaps the rolling total (mode 5) and leaves the pinned request in place.
+        for _ in 0..30 { h.tick(Inputs { mode: 5, ..inputs(4, 95) }); }
+        assert_eq!((h.bolt_recent.displayed, h.slots[2].flags), (95, 0x10));
+        // The vendor exits on the tick a pickup arrives: `CollectBolt`'s queue reaches the HUD before the tick
+        // (the game's call log is applied first), so slot 2 is re-armed before the release.
+        h.bolts_pinned = false;
+        h.apply_calls(&[Call::Queue(Request::BOLTS)]);
+        h.tick(inputs(4, 96));
+        assert_eq!(h.slots[2].flags, 0, "the exit clears the pin");
+        for _ in 0..400 { h.tick(inputs(4, 96)); }
+        assert_eq!((h.slots[2].slide, h.bolt_recent.pending(96)), (0, 0), "the counter hides");
     }
 
     #[test]
