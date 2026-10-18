@@ -874,17 +874,14 @@ pub fn drop_bolts(w: &mut World, id: MobyId) {
 pub fn set_death_bits(w: &mut World, id: MobyId, fl: u32, path: i32) {
     let (b4, b1, b2, b0, b6) = { let m = w.m(id); (m.b4, m.spawn_flag, m.spawn_id, m.mission, m.b6) };
     let mut f = Pf::from_i32(b4 as i32);
+    // RAC2's challenge-mode multiplier counts the creature's death here (`SetDeathBits` 0x2a6c58's tail). It runs
+    // before the early return: droppers with no save bits (`+0xb1 = 0xfe`, spawn flags 0) are still kills.
+    w.creature_killed(id);
     if b1 == 0xfe || b2 < 0 { return; }
     let lvl = w.svc.level;
-    let first_death = !w.svc.save.death.contains(&(lvl, b2));
     w.svc.save.death.insert((lvl, b2));
     w.svc.save.death_level.insert(b2);
     w.svc.save.killed.insert(b2, b0.wrapping_add(2));
-    // RAC2's challenge-mode bolt multiplier: a creature's first death (class type 5) is one kill. The death bit is
-    // per spawn, so a later `SetDeathBits` for the same moby (the Suck Cannon's swallow, a class's second path) does
-    // not count twice.
-    let creature = w.classes.info(w.m(id).o_class).is_some_and(|i| i.ty == 5);
-    if first_death && creature { w.svc.counters.enemy_killed(); }
     if b0 == 0xff || (w.missions.mission_slot(b0) != 0xff && w.mission_done(lvl, b0) == 0xff) {
         w.svc.save.collected.insert(b2, b0.wrapping_add(2));
     }
@@ -1117,5 +1114,25 @@ mod tests {
         assert_eq!(run(0, 0), 20);
         assert_eq!(run(0, 1), 40, "the game-beaten double still applies outside challenge mode");
         assert_eq!(run(1, 1), 20, "challenge mode drops the ordinary rate");
+    }
+
+    /// A dropper with no spawn flags (`+0xb1 = 0xfe`, where `SetDeathBits`'s save bits return early) still counts as
+    /// a kill for the multiplier, and the same death reached twice counts once.
+    #[test]
+    fn flagless_creature_deaths_still_count() {
+        let moby = Moby { o_class: 459, spawn_flag: 0xfe, spawn_id: 7, pvars: vec![0; 0x80], ..Moby::default() };
+        let mut t = MobyTable::new(vec![moby], 0);
+        let hero = crate::hero::Hero::new();
+        let mut rng = crate::rng::Rng::new();
+        let mut classes = crate::moby_update::ClassTable::default();
+        classes.classes.insert(459, (ClassInfo { ty: 5, ..Default::default() }, None));
+        let mut svc = Services::new();
+        svc.counters.times_completed = 1;
+        {
+            let mut w = World::new(&mut t, &hero, &mut rng, &classes, &mut svc, 0);
+            set_death_bits(&mut w, 0, 0, -1);
+            set_death_bits(&mut w, 0, 0, -1);
+        }
+        assert_eq!(svc.counters.bolt_multiplier.level, 2, "one kill, counted once");
     }
 }

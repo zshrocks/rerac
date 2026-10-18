@@ -695,6 +695,9 @@ pub struct GameCounters {
     /// RAC2's challenge-mode bolt multiplier (port-only). It is 1 outside challenge mode and reset on every hit or
     /// death; what it scales is the ordinary bolt value (see [`GameCounters::bolt_value`]).
     pub bolt_multiplier: BoltMultiplier,
+    /// `(level, spawn id)` of the kills [`GameCounters::enemy_killed`] has counted. `Services` is rebuilt per level,
+    /// so it clears with the level like the multiplier itself.
+    pub bolt_kill_counted: std::collections::HashSet<(u32, i16)>,
 }
 
 impl GameCounters {
@@ -707,9 +710,13 @@ impl GameCounters {
     /// multiplier (RAC1's `BoltBurst` double is dropped instead, so the base stays unmodified).
     pub fn bolt_value(&self, base: i32) -> i32 { base.saturating_mul(self.bolt_multiplier_level()) }
 
-    /// A creature died (`SetDeathBits` on a class type 5): one kill for the multiplier in challenge mode.
-    pub fn enemy_killed(&mut self) {
-        if self.times_completed != 0 { self.bolt_multiplier.kill(); }
+    /// A creature died (`SetDeathBits`'s tail, or a class whose death path skips it: the Blarg ships): one kill for
+    /// the multiplier in challenge mode. A placed moby's spawn id names it, so its death counts once however many
+    /// paths reach here; a dynamic moby (no spawn id) has nothing to remember it by and counts every call.
+    pub fn enemy_killed(&mut self, level: u32, spawn_id: i16) {
+        if self.times_completed == 0 { return; }
+        if spawn_id >= 0 && !self.bolt_kill_counted.insert((level, spawn_id)) { return; }
+        self.bolt_multiplier.kill();
     }
 
     /// A hit taken or a death (`DamageEvent`): the multiplier goes back to ×1.
@@ -1833,6 +1840,16 @@ impl<'a> World<'a> {
         Arc::make_mut(&mut self.svc.grid).remove(&mut self.table.mobys[id]);
     }
 
+    /// One death of the creature `id` for RAC2's challenge-mode multiplier: class type 5 only, one per placed spawn
+    /// ([`GameCounters::enemy_killed`]). `SetDeathBits` calls it; the Blarg ships' death paths, which skip that
+    /// function, call it directly.
+    pub fn creature_killed(&mut self, id: MobyId) {
+        let Some((o_class, spawn_id)) = self.table.mobys.get(id).map(|m| (m.o_class, m.spawn_id)) else { return };
+        if !self.classes.info(o_class).is_some_and(|i| i.ty == 5) { return; }
+        let level = self.svc.level;
+        self.svc.counters.enemy_killed(level, spawn_id);
+    }
+
     /// `MobyGetHitMessage(m, mask, keep)` 0x26f320: the record in slot `moby+0xa4` when it targets this moby
     /// and `flags & mask ≠ 0`. A record for this moby whose flags miss the mask is dropped (`+0xa4 = 0xff`)
     /// unless `keep`.
@@ -2567,19 +2584,26 @@ mod tests {
         assert_eq!((m.level, m.kills), (1, 0));
     }
 
-    /// The multiplier applies only in challenge mode, to the ordinary value; the hit/death reset restores ×1.
+    /// The multiplier applies only in challenge mode, to the ordinary value; the hit/death reset restores ×1, and a
+    /// placed spawn's death counts once.
     #[test]
     fn bolt_multiplier_only_scales_challenge_mode_pickups() {
         let mut c = GameCounters::default();
         assert_eq!((c.bolt_multiplier_level(), c.bolt_value(50)), (1, 50));
         c.times_completed = 1;
-        for _ in 0..6 { c.enemy_killed(); }
+        c.enemy_killed(1, 7);
+        c.enemy_killed(1, 7);
+        assert_eq!(c.bolt_multiplier_level(), 2, "one spawn, one kill");
+        // Six kills in all (×2 at 1, ×3 at 2, ×4 at 4, ×5 at 6).
+        for spawn in 8..=12 { c.enemy_killed(1, spawn); }
         assert_eq!((c.bolt_multiplier_level(), c.bolt_value(50)), (5, 250));
+        c.enemy_killed(2, 7);
+        assert_eq!(c.bolt_multiplier_level(), 5, "a seventh kill does not step ×5 yet");
         c.bolt_multiplier_reset();
         assert_eq!((c.bolt_multiplier_level(), c.bolt_value(50)), (1, 50));
         // Outside challenge mode kills leave it alone.
         c.times_completed = 0;
-        for _ in 0..6 { c.enemy_killed(); }
+        for spawn in 20..26 { c.enemy_killed(1, spawn); }
         assert_eq!(c.bolt_multiplier_level(), 1);
     }
 }

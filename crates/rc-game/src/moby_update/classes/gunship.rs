@@ -278,6 +278,8 @@ fn volley(w: &mut World, id: MobyId) -> bool {
 /// A hit (mask 0x800000): the explosion, the links and the ship deleted (module doc).
 fn kill(w: &mut World, id: MobyId, f: f32) {
     crate::moby_update::story::award_skill_point(w, 0);
+    // The Blarg ships skip `SetDeathBits`; RAC2's multiplier counts their death here.
+    w.creature_killed(id);
     fx::beam_explosion(w, &flyer::KILL_BEAM, Some(id), c::pos(w, id));
     // `0x30be70(2f, m, P+0xd0 − P+0xe0)`: the wreck 1510 (`classes::burning_wreck`).
     let dir = c::sub(c::pv4(w, id, 0xd0), c::pv4(w, id, 0xe0));
