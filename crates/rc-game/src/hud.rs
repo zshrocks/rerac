@@ -132,13 +132,15 @@ const DIGIT_W: i32 = 13;
 /// [`BoltRecent::displayed`] to the real count (drawn by [`HudState::draw_bolts`]) and the pending amount holds
 /// `BOLT_RECENT_HOLD` ticks after its last change (RAC2's popup timer reaching 0x3d), then rolls in at
 /// `accum / BOLT_RECENT_DRAIN` a tick for `BOLT_RECENT_DRAIN_TICKS + 1` ticks (the popup's state 3). The pending
-/// number's y sits under the bolt bar (32 tall); its tween is gold (`rgba` is `0xAABBGGRR`).
+/// number's y sits under the bolt bar (32 tall); a gain takes the total's own tween, a spend the bolt alert's red.
 const BOLT_RECENT_HOLD: i32 = 61;
 const BOLT_RECENT_DRAIN: i32 = 14;
 const BOLT_RECENT_DRAIN_TICKS: i32 = 15;
 const BOLT_RECENT_Y: i32 = ELEMENT_Y + 32 + 2;
-const BOLT_RECENT_FROM: u32 = 0x0040_c8ff;
-const BOLT_RECENT_TO: u32 = 0x8040_c8ff;
+/// The pending amount's tween when it is negative (a spend), drawn with the minus sign `i32::to_string` writes:
+/// the bolt alert's red ([`meters`]' `0x000000ff` → `0x800000ff`; `rgba` is `0xAABBGGRR`).
+const BOLT_SPEND_FROM: u32 = 0x0000_00ff;
+const BOLT_SPEND_TO: u32 = 0x8000_00ff;
 /// 0x15f91c / 0x15f920 weapon ramp steps, 0x15f924 / 0x15f928 bar length (max ammo < 100 / ≥ 100),
 /// 0x15f934 / 0x15f938 empty-ammo colour tween, 0x15f93c / 0x15f940 text offset.
 const WEAPON_STEPS: i32 = 8;
@@ -1443,13 +1445,14 @@ impl HudState {
             k += 3;
         }
         // The "bolts picked up" element (RAC2's `UpdateBoltCounterHud` 0x28a2f8, port-only): the pending amount,
-        // right-aligned with the total, under the bar. It fades out over its roll into the total
-        // ([`BoltRecent::fade`]).
+        // right-aligned with the total, under the bar. A gain takes the total's colour; a spend is red, with the
+        // minus sign `to_string` writes. It fades out over its roll into the total ([`BoltRecent::fade`]).
         let pending = self.bolt_recent.pending(self.inputs.bolts);
-        if pending > 0 {
+        if pending != 0 {
             let number = pending.to_string().into_bytes();
+            let (from, to) = if pending > 0 { (TEXT_FROM, TEXT_TO) } else { (BOLT_SPEND_FROM, BOLT_SPEND_TO) };
             let g = f * self.bolt_recent.fade();
-            let (recent_colour, recent_shadow) = (tween_color(g, BOLT_RECENT_FROM, BOLT_RECENT_TO), tween_color(g, 0, 0x8000_0000));
+            let (recent_colour, recent_shadow) = (tween_color(g, from, to), tween_color(g, 0, 0x8000_0000));
             self.text_right(tx + 1, BOLT_RECENT_Y + 1, recent_shadow, &number, out);
             self.text_right(tx, BOLT_RECENT_Y, recent_colour, &number, out);
         }
@@ -2272,7 +2275,7 @@ mod tests {
         assert_eq!((h.bolt_recent.displayed, h.bolt_recent.pending(95)), (95, 0));
     }
 
-    /// The pending amount is drawn under the rolling total, right-aligned with it, in the recent (gold) tween.
+    /// The pending amount is drawn under the rolling total, right-aligned with it, in the total's own colour.
     #[test]
     fn bolt_recent_draws_under_the_total() {
         let mut h = HudState::new(assets());
@@ -2287,7 +2290,22 @@ mod tests {
             Draw::Text { y, rgba, text, .. } if *y == BOLT_RECENT_Y && *text == b"37".to_vec() => Some(*rgba),
             _ => None,
         });
-        assert_eq!(recent, Some(0x8040_c8ff));
+        assert_eq!(recent, Some(TEXT_TO), "the total's own tween");
+    }
+
+    /// A spend shows as a red number with a minus sign.
+    #[test]
+    fn bolt_recent_shows_a_spend_in_red() {
+        let mut h = HudState::new(assets());
+        h.tick(inputs(4, 100));
+        h.tick(inputs(4, 95));
+        let mut d = Vec::new();
+        for _ in 0..20 { d = h.tick(inputs(4, 95)); }
+        let recent = d.iter().find_map(|x| match x {
+            Draw::Text { y, rgba, text, .. } if *y == BOLT_RECENT_Y => Some((*rgba, text.clone())),
+            _ => None,
+        });
+        assert_eq!(recent, Some((BOLT_SPEND_TO, b"-5".to_vec())));
     }
 
     #[test]
