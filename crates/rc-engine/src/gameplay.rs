@@ -2542,7 +2542,9 @@ fn tick(
         }
     }
     // RAC2's challenge-mode bolt multiplier follows the running game across planet changes (`GameState` keeps it; it
-    // is not saved). Kills step it in the moby loop and hits/deaths reset it just above.
+    // is not saved). Kills step it in the moby loop and hits/deaths reset it just above; the bounds check (0x229f20)
+    // sets `fell_out` and returns OutOfBounds without the death sequence, so it resets explicitly too.
+    if p.game.hero.fell_out != 0 { p.svc.counters.bolt_multiplier_reset(); }
     if let Some(gs) = state.as_mut() { gs.0.bolt_multiplier = p.svc.counters.bolt_multiplier; }
     if let HeroTick::Unimplemented(s) = report.hero {
         if !std::mem::replace(&mut p.frozen_hint, true) { println!("gameplay: hero frozen in unported state {s:#x}; R respawns"); }
