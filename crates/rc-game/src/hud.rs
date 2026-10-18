@@ -132,15 +132,12 @@ const DIGIT_W: i32 = 13;
 /// [`BoltRecent::displayed`] to the real count (drawn by [`HudState::draw_bolts`]) and the pending amount holds
 /// `BOLT_RECENT_HOLD` ticks after its last change (RAC2's popup timer reaching 0x3d), then rolls in at
 /// `accum / BOLT_RECENT_DRAIN` a tick for `BOLT_RECENT_DRAIN_TICKS + 1` ticks (the popup's state 3). The pending
-/// number's y sits under the bolt bar (32 tall); a gain takes the total's own tween, a spend the bolt alert's red.
+/// number's y sits under the bolt bar (32 tall); a gain takes the total's own tween, a spend the ammo counter's
+/// out-of-ammo red ([`EMPTY_FROM`] / [`EMPTY_TO`]).
 const BOLT_RECENT_HOLD: i32 = 61;
 const BOLT_RECENT_DRAIN: i32 = 14;
 const BOLT_RECENT_DRAIN_TICKS: i32 = 15;
 const BOLT_RECENT_Y: i32 = ELEMENT_Y + 32 + 2;
-/// The pending amount's tween when it is negative (a spend), drawn with the minus sign `i32::to_string` writes:
-/// the bolt alert's red ([`meters`]' `0x000000ff` → `0x800000ff`; `rgba` is `0xAABBGGRR`).
-const BOLT_SPEND_FROM: u32 = 0x0000_00ff;
-const BOLT_SPEND_TO: u32 = 0x8000_00ff;
 /// 0x15f91c / 0x15f920 weapon ramp steps, 0x15f924 / 0x15f928 bar length (max ammo < 100 / ≥ 100),
 /// 0x15f934 / 0x15f938 empty-ammo colour tween, 0x15f93c / 0x15f940 text offset.
 const WEAPON_STEPS: i32 = 8;
@@ -1450,7 +1447,7 @@ impl HudState {
         let pending = self.bolt_recent.pending(self.inputs.bolts);
         if pending != 0 {
             let number = pending.to_string().into_bytes();
-            let (from, to) = if pending > 0 { (TEXT_FROM, TEXT_TO) } else { (BOLT_SPEND_FROM, BOLT_SPEND_TO) };
+            let (from, to) = if pending > 0 { (TEXT_FROM, TEXT_TO) } else { (EMPTY_FROM, EMPTY_TO) };
             let g = f * self.bolt_recent.fade();
             let (recent_colour, recent_shadow) = (tween_color(g, from, to), tween_color(g, 0, 0x8000_0000));
             self.text_right(tx + 1, BOLT_RECENT_Y + 1, recent_shadow, &number, out);
@@ -2305,7 +2302,7 @@ mod tests {
             Draw::Text { y, rgba, text, .. } if *y == BOLT_RECENT_Y => Some((*rgba, text.clone())),
             _ => None,
         });
-        assert_eq!(recent, Some((BOLT_SPEND_TO, b"-5".to_vec())));
+        assert_eq!(recent, Some((EMPTY_TO, b"-5".to_vec())));
     }
 
     #[test]
