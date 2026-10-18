@@ -2518,12 +2518,15 @@ fn tick(
         let gs = state.as_mut().map(|g| &mut g.0);
         match e {
             DamageEvent::Hit => {
+                // RAC2's challenge-mode bolt multiplier goes back to ×1 on any hit taken.
+                p.svc.counters.bolt_multiplier_reset();
                 if let Some(gs) = gs {
                     gs.global.total_hits += 1;
                     if let Some(l) = gs.levels.get_mut(level_index as usize) { l.hits += 1; }
                 }
             }
             DamageEvent::Died { killer_mission, killer_class } => {
+                p.svc.counters.bolt_multiplier_reset();
                 if let Some(gs) = gs {
                     gs.global.total_deaths += 1;
                     if let Some(l) = gs.levels.get_mut(level_index as usize) { l.deaths += 1; }

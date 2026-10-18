@@ -626,6 +626,39 @@ pub struct SaveBits {
     pub checkpoint_visit: Vec<crate::moby_update::visit::Visit>,
 }
 
+/// RAC2's challenge-mode bolt multiplier (`g_boltMultiplier` 0x1a7a32 and its kill counter 0x1a7a33, stepped by
+/// `IncrementBestiaryKillCount` 0x2a6ae0's tail). RAC1 has no such value: [`GameCounters::times_completed`] gates
+/// it, and the ordinary (not the challenge-doubled) bolt rate is the base it scales.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoltMultiplier {
+    /// 1..=[`BoltMultiplier::MAX`]: what a collected bolt's value is scaled by.
+    pub level: i32,
+    /// Kills since the last step: at `kills·2 ≥ level` the multiplier steps up and the counter clears.
+    pub kills: i32,
+}
+
+impl Default for BoltMultiplier {
+    fn default() -> Self { BoltMultiplier { level: 1, kills: 0 } }
+}
+
+impl BoltMultiplier {
+    pub const MAX: i32 = 20;
+
+    /// One enemy killed: the thresholds are the game's `counter·2 ≥ multiplier` rule, i.e. 0, 1, 2, 4, 6, 9, 12,
+    /// 16, 20, 25, 30, 36, 42, 49, 56, 64, 72, 81, 90 and 100 kills for ×1..×20.
+    pub fn kill(&mut self) {
+        if self.level >= Self::MAX { return; }
+        self.kills += 1;
+        if self.kills * 2 >= self.level {
+            self.kills = 0;
+            self.level += 1;
+        }
+    }
+
+    /// Back to ×1: a hit taken, a death, or a level load (RAC2's `FUN_002de990`).
+    pub fn reset(&mut self) { *self = BoltMultiplier::default(); }
+}
+
 /// Game-state words the ported classes read or add to (owned here until the game-state port takes them).
 #[derive(Clone, Debug, Default)]
 pub struct GameCounters {
@@ -659,6 +692,28 @@ pub struct GameCounters {
     /// `0x15eda0`: max health (4; 5 / 8 with the nanotech upgrades), synced from the game state by the engine;
     /// the nanotech orbs heal up to it.
     pub max_hp: i32,
+    /// RAC2's challenge-mode bolt multiplier (port-only). It is 1 outside challenge mode and reset on every hit or
+    /// death; what it scales is the ordinary bolt value (see [`GameCounters::bolt_value`]).
+    pub bolt_multiplier: BoltMultiplier,
+}
+
+impl GameCounters {
+    /// The multiplier in force: 1 outside challenge mode (`times_completed` 0x15ee20), else the stepped level.
+    pub fn bolt_multiplier_level(&self) -> i32 {
+        if self.times_completed != 0 { self.bolt_multiplier.level } else { 1 }
+    }
+
+    /// The bolts one collected coin of `base` credits: RAC2's challenge mode scales the ordinary value by the
+    /// multiplier (RAC1's `BoltBurst` double is dropped instead, so the base stays unmodified).
+    pub fn bolt_value(&self, base: i32) -> i32 { base.saturating_mul(self.bolt_multiplier_level()) }
+
+    /// A creature died (`SetDeathBits` on a class type 5): one kill for the multiplier in challenge mode.
+    pub fn enemy_killed(&mut self) {
+        if self.times_completed != 0 { self.bolt_multiplier.kill(); }
+    }
+
+    /// A hit taken or a death (`DamageEvent`): the multiplier goes back to ×1.
+    pub fn bolt_multiplier_reset(&mut self) { self.bolt_multiplier.reset(); }
 }
 
 /// The mission tables the death-bit and pickup writes consult: `0x15fc88[mission]` and
@@ -2489,5 +2544,42 @@ mod tests {
             for _ in 0..3 { type11::throttle(load.map(|x| x.0), &mut rd); }
             assert_eq!(rc.state, rd.state, "throttle-only draws, load {load:?}");
         }
+    }
+
+    /// The RAC2 multiplier's thresholds (0, 1, 2, 4, 6, … 100 kills for ×1..×20) and its cap.
+    #[test]
+    fn bolt_multiplier_steps_at_the_rac2_thresholds() {
+        let mut m = BoltMultiplier::default();
+        assert_eq!((m.level, m.kills), (1, 0));
+        let mut kills = 0;
+        for level in 2..=BoltMultiplier::MAX {
+            while m.level < level {
+                m.kill();
+                kills += 1;
+            }
+            assert_eq!(kills, level * level / 4, "×{level}");
+            assert_eq!(m.kills, 0, "×{level}: the counter clears on the step");
+        }
+        // At ×20 the kills no longer move anything.
+        for _ in 0..10 { m.kill(); }
+        assert_eq!((m.level, m.kills), (BoltMultiplier::MAX, 0));
+        m.reset();
+        assert_eq!((m.level, m.kills), (1, 0));
+    }
+
+    /// The multiplier applies only in challenge mode, to the ordinary value; the hit/death reset restores ×1.
+    #[test]
+    fn bolt_multiplier_only_scales_challenge_mode_pickups() {
+        let mut c = GameCounters::default();
+        assert_eq!((c.bolt_multiplier_level(), c.bolt_value(50)), (1, 50));
+        c.times_completed = 1;
+        for _ in 0..6 { c.enemy_killed(); }
+        assert_eq!((c.bolt_multiplier_level(), c.bolt_value(50)), (5, 250));
+        c.bolt_multiplier_reset();
+        assert_eq!((c.bolt_multiplier_level(), c.bolt_value(50)), (1, 50));
+        // Outside challenge mode kills leave it alone.
+        c.times_completed = 0;
+        for _ in 0..6 { c.enemy_killed(); }
+        assert_eq!(c.bolt_multiplier_level(), 1);
     }
 }

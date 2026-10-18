@@ -876,9 +876,15 @@ pub fn set_death_bits(w: &mut World, id: MobyId, fl: u32, path: i32) {
     let mut f = Pf::from_i32(b4 as i32);
     if b1 == 0xfe || b2 < 0 { return; }
     let lvl = w.svc.level;
+    let first_death = !w.svc.save.death.contains(&(lvl, b2));
     w.svc.save.death.insert((lvl, b2));
     w.svc.save.death_level.insert(b2);
     w.svc.save.killed.insert(b2, b0.wrapping_add(2));
+    // RAC2's challenge-mode bolt multiplier: a creature's first death (class type 5) is one kill. The death bit is
+    // per spawn, so a later `SetDeathBits` for the same moby (the Suck Cannon's swallow, a class's second path) does
+    // not count twice.
+    let creature = w.classes.info(w.m(id).o_class).is_some_and(|i| i.ty == 5);
+    if first_death && creature { w.svc.counters.enemy_killed(); }
     if b0 == 0xff || (w.missions.mission_slot(b0) != 0xff && w.mission_done(lvl, b0) == 0xff) {
         w.svc.save.collected.insert(b2, b0.wrapping_add(2));
     }
@@ -933,7 +939,10 @@ pub fn bolt_burst(w: &mut World, id: MobyId, lo: i32, hi: i32, flags: u32, path:
     }
     let lo = if lo > 0 { lo } else { 1 };
     let mut n = w.rng.randi(hi - lo + 1) + lo;
-    let dbl = w.svc.counters.double_a != 0 || w.svc.counters.times_completed != 0;
+    // RAC2's challenge mode replaces RAC1's doubled BoltBurst with the bolt multiplier, which the pickup applies
+    // to the ordinary value (`GameCounters::bolt_value`): the drop rate stays unmodified.
+    let challenge = w.svc.counters.times_completed != 0;
+    let dbl = !challenge && w.svc.counters.double_a != 0;
     if dbl { n <<= 1; }
     if n < 500 && dc != 0 && w.svc.counters.challenge_limit != 0 {
         let t60 = w.ticks(0x3c);
@@ -1013,7 +1022,7 @@ pub fn bolt_burst(w: &mut World, id: MobyId, lo: i32, hi: i32, flags: u32, path:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::moby_runtime::{Moby, MobyTable};
+    use crate::moby_runtime::{ClassInfo, Moby, MobyTable};
     use crate::moby_update::services::Services;
     use crate::moby_update::triggers;
 
@@ -1083,5 +1092,30 @@ mod tests {
         let dx = f32::from_le_bytes(blk[0x10..0x14].try_into().unwrap());
         assert!((rz - q).abs() < 1e-5 && (dx - v[0]).abs() < 1e-6);
         assert_eq!(c.occlusion, 0x7f80);
+    }
+
+    /// `BoltBurst`'s challenge double is replaced by the pickup multiplier: the base burst is the ordinary rate.
+    #[test]
+    fn challenge_mode_keeps_the_ordinary_burst() {
+        let run = |times_completed: i32, double_a: i32| -> i32 {
+            let mut t = MobyTable::new(vec![Moby { o_class: 707, pvars: vec![0; 0x100], ..Moby::default() }], 40);
+            t.free_slots = 1000;
+            let hero = crate::hero::Hero::new();
+            let mut rng = crate::rng::Rng::new();
+            let mut classes = crate::moby_update::ClassTable::default();
+            for c in [13, 14, 15, 16] { classes.classes.insert(c, (ClassInfo::default(), None)); }
+            let mut svc = Services::new();
+            svc.level = 0;
+            svc.counters.times_completed = times_completed;
+            svc.counters.double_a = double_a;
+            {
+                let mut w = World::new(&mut t, &hero, &mut rng, &classes, &mut svc, 0);
+                bolt_burst(&mut w, 0, 20, 20, 1, -1);
+            }
+            t.mobys.iter().filter(|m| (13..=16).contains(&m.o_class)).map(|m| bolt::value(m.o_class)).sum()
+        };
+        assert_eq!(run(0, 0), 20);
+        assert_eq!(run(0, 1), 40, "the game-beaten double still applies outside challenge mode");
+        assert_eq!(run(1, 1), 20, "challenge mode drops the ordinary rate");
     }
 }

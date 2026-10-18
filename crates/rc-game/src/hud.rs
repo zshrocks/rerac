@@ -128,6 +128,11 @@ const BOLT_TEXT_D: (i32, i32) = (-32, 8);
 const SEP_APOSTROPHE_D: (i32, i32) = (-30, 21);
 const SEP_DOT_D: (i32, i32) = (-29, 10);
 const DIGIT_W: i32 = 13;
+/// The RAC2 challenge-mode multiplier's `xN`, left of the total on its line: gold (the `rgba` is 0xAABBGGRR, RGB
+/// 0xffc840), six pixels from the count.
+const BOLT_MULTIPLIER_FROM: u32 = 0x0040_c8ff;
+const BOLT_MULTIPLIER_TO: u32 = 0x8040_c8ff;
+const BOLT_MULTIPLIER_GAP: i32 = 6;
 /// The "bolts picked up" element ([`BoltRecent`]): RAC2's `UpdateBoltCounterHud` 0x28a2f8. The total rolls from
 /// [`BoltRecent::displayed`] to the real count (drawn by [`HudState::draw_bolts`]) and the pending amount holds
 /// `BOLT_RECENT_HOLD` ticks after its last change (RAC2's popup timer reaching 0x3d), then rolls in at
@@ -504,6 +509,9 @@ pub struct Inputs {
     pub beam_lock: i16,
     /// 0x141398: a buried bolt cache within 20 (the bolt alert's flag, `classes::buried_bolts`).
     pub bolt_alert: bool,
+    /// The RAC2 challenge-mode bolt multiplier (`GameCounters::bolt_multiplier_level`): 1 outside challenge mode,
+    /// 2..20 drawn as a gold `xN` to the left of the total.
+    pub bolt_multiplier: i32,
     /// 0x15ee58 / 0x15ee5c (Blackwater City, Kalebo III) the best race times in ticks and 0x15ee68 / 0x15ee6c the best
     /// scores: written by the races (G-LVL-007), 0 until they are ported.
     pub race_best_time: [i32; 2],
@@ -564,6 +572,7 @@ impl Default for Inputs {
             race_won: false,
             pal: false,
             race_meter: Default::default(),
+            bolt_multiplier: 1,
         }
     }
 }
@@ -1434,7 +1443,12 @@ impl HudState {
             digits += 1;
             v /= 10;
         }
-        let w = ((DIGIT_W * digits) as f32 * sf) as i32;
+        // RAC2's challenge-mode bolt multiplier: a gold `xN` left of the count (its update draws nothing at ×1).
+        // It widens the bar, so it sits inside it as the count does.
+        let mult = self.inputs.bolt_multiplier;
+        let mult_text = (mult > 1).then(|| format!("x{mult}").into_bytes());
+        let mult_w = mult_text.as_ref().map_or(0, |t| self.assets.text_width(Font::Regular, t) + BOLT_MULTIPLIER_GAP);
+        let w = (((DIGIT_W * digits + mult_w) as f32) * sf) as i32;
         let left = x - 0x1c - w;
         let (cap, mid) = (self.assets.icon_frame(icon::BAR, 1), self.assets.icon_frame(icon::BAR, 0));
         out.push(Self::sprite(cap, x - 12, y, 32, 32, bar_a, Rot::R180));
@@ -1454,6 +1468,13 @@ impl HudState {
             self.text_right(x + dx - DIGIT_W * k + 2, y + dy + 2, shadow, sep, out);
             self.text_right(x + dx - DIGIT_W * k, y + dy, colour, sep, out);
             k += 3;
+        }
+        // RAC2's challenge-mode bolt multiplier: a gold `xN` left of the count (its update draws nothing at ×1).
+        if let Some(text) = &mult_text {
+            let mx = tx - self.assets.text_width(Font::Regular, &number) - BOLT_MULTIPLIER_GAP;
+            let colour = tween_color(f, BOLT_MULTIPLIER_FROM, BOLT_MULTIPLIER_TO);
+            self.text_right(mx + 1, ty + 1, shadow, text, out);
+            self.text_right(mx, ty, colour, text, out);
         }
         // The "bolts picked up" element (RAC2's `UpdateBoltCounterHud` 0x28a2f8, port-only): the pending amount,
         // right-aligned with the total, under the bar. A gain takes the total's colour; a spend is red, with the
@@ -2317,6 +2338,28 @@ mod tests {
             _ => None,
         });
         assert_eq!(recent, Some((EMPTY_TO, b"-5".to_vec())));
+    }
+
+    /// RAC2's challenge-mode bolt multiplier draws as a gold `xN` left of the total; ×1 draws nothing.
+    #[test]
+    fn bolt_multiplier_draws_gold_left_of_the_total() {
+        let mut h = HudState::new(assets());
+        h.tick(inputs(4, 0));
+        let mut d = Vec::new();
+        for _ in 0..20 { d = h.tick(Inputs { bolt_multiplier: 4, ..inputs(4, 37) }); }
+        let total = d.iter().find_map(|x| match x {
+            Draw::Text { x, y, text, .. } if *y == ELEMENT_Y + 8 && text == b"0" => Some(*x),
+            _ => None,
+        }).expect("the total");
+        let (mx, my, rgba) = d.iter().find_map(|x| match x {
+            Draw::Text { x, y, rgba, text, .. } if text == b"x4" && *rgba == BOLT_MULTIPLIER_TO => Some((*x, *y, *rgba)),
+            _ => None,
+        }).expect("the multiplier");
+        assert_eq!((my, rgba), (ELEMENT_Y + 8, BOLT_MULTIPLIER_TO), "on the total's line, in gold");
+        assert!(mx < total, "left of the total: {mx} < {total}");
+        // ×1 is not drawn (the update skips it).
+        let d = h.tick(inputs(4, 37));
+        assert!(!d.iter().any(|x| matches!(x, Draw::Text { text, .. } if text == b"x1")));
     }
 
     /// A spend at the vendor does not re-arm the counter (only `CollectBolt` does), so the vendor's pin handle stays
