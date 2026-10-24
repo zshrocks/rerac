@@ -62,6 +62,7 @@
 //! | `randf` 0x26c9c8 in the bubble inits | the game's one stream | NOT ported: a HUD-local newlib stream (G-UI-011) |
 //! | 0x27b028 `NpcTalkUpdate` | bolt counter queued and kept up `ScaleTicks(60)` for NPC nodes of kind 1 / 6 | `interact::talk_update_at` → `Services::hud` |
 //! | 0x2bc4f0 `CollectBolt` | the bolt counter queued | `classes::bolt` → `Services::hud` (and the count's change, `frame_calls`) |
+//! | RAC2 `UpdateBoltCounterHud` 0x28a2f8 | port-only: the rolling total and the "bolts picked up" element, the pending amount under it | [`BoltRecent`] (`frame_calls` → [`BoltRecent::step`], `draw_bolts`) |
 //! | 0x24fb50 second banner line 0x1795e8 (countdown > 1000) | | NOT ported (G-UI-011) |
 //! | level05 0x24cee8 / level16 0x21e398 race HUD, slots 5 / 7 (`0x2661a0` init, `0x2661e8` update, draws `0x266320` / `0x266710`) | lap and place, time (and the score once the race is won), on the board only; level 16's board-weapon count box (0x238a30) | [`Element::RaceLap`] / [`Element::RaceTime`] (queued by the board's 0x6b entry: `crate::hero::hoverboard`) |
 //! | level05 race HUD slot 0 \| 0x10 (`0x262ae8` / `0x262b58` / `0x262f50`, data 0x13fbb4) | the boost meter, the trick-combo texts, the wrong-way warning (time trials) | [`Element::RaceMeter`] (its game part: `crate::hero::hoverboard::meter_tick`) |
@@ -127,6 +128,16 @@ const BOLT_TEXT_D: (i32, i32) = (-32, 8);
 const SEP_APOSTROPHE_D: (i32, i32) = (-30, 21);
 const SEP_DOT_D: (i32, i32) = (-29, 10);
 const DIGIT_W: i32 = 13;
+/// The "bolts picked up" element ([`BoltRecent`]): RAC2's `UpdateBoltCounterHud` 0x28a2f8. The total rolls from
+/// [`BoltRecent::displayed`] to the real count (drawn by [`HudState::draw_bolts`]) and the pending amount holds
+/// `BOLT_RECENT_HOLD` ticks after its last change (RAC2's popup timer reaching 0x3d), then rolls in at
+/// `accum / BOLT_RECENT_DRAIN` a tick for `BOLT_RECENT_DRAIN_TICKS + 1` ticks (the popup's state 3). The pending
+/// number's y sits under the bolt bar (32 tall); a gain takes the total's own tween, a spend the ammo counter's
+/// out-of-ammo red ([`EMPTY_FROM`] / [`EMPTY_TO`]).
+const BOLT_RECENT_HOLD: i32 = 61;
+const BOLT_RECENT_DRAIN: i32 = 14;
+const BOLT_RECENT_DRAIN_TICKS: i32 = 15;
+const BOLT_RECENT_Y: i32 = ELEMENT_Y + 32 + 2;
 /// 0x15f91c / 0x15f920 weapon ramp steps, 0x15f924 / 0x15f928 bar length (max ammo < 100 / ≥ 100),
 /// 0x15f934 / 0x15f938 empty-ammo colour tween, 0x15f93c / 0x15f940 text offset.
 const WEAPON_STEPS: i32 = 8;
@@ -377,6 +388,63 @@ pub struct Banner {
 /// Help box text colour (small font, `0x80ffa888` with the state's alpha).
 const HELP_COLOUR: u32 = 0x00ff_a888;
 
+/// The "bolts picked up" element (a port-only addition; RAC2's `UpdateBoltCounterHud` 0x28a2f8): the total rolls
+/// from [`BoltRecent::displayed`] up to the real count and the pending amount `bolts − displayed` is drawn under it
+/// ([`HudState::draw_bolts`]). RAC2 keeps the pending in two popup slots that hold for 61 ticks after their last
+/// change and then roll into the displayed count at `accum / 14` a tick for 16 ticks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BoltRecent {
+    /// `g_nBoltCounterDisplayed` 0x1b1948: the count the total is drawn from, rolling toward the real one.
+    pub displayed: i32,
+    /// Ticks the pending amount has held since it last changed; the drain starts at [`BOLT_RECENT_HOLD`].
+    hold: i32,
+    /// The displayed count when the drain started (RAC2's target +4).
+    target: i32,
+    /// The pending amount frozen at the commit (RAC2's accumulator +8).
+    accum: i32,
+    /// Drain ticks from −1 (RAC2's state-3 timer); the drain finishes at [`BOLT_RECENT_DRAIN_TICKS`].
+    drain: i32,
+    /// RAC2's popup state 3.
+    draining: bool,
+}
+
+impl BoltRecent {
+    /// One 60 Hz tick (`UpdateBoltCounterHud` 0x28a2f8): `bolts` is the real count, `delta` its change this tick
+    /// (`None`: unchanged) and `mode` the game mode 0x15f5c4 (5, the vendor, snaps the counter when it is ahead of
+    /// the real count: `ResetBoltCounterHud` 0x28a278).
+    fn step(&mut self, bolts: i32, delta: Option<i32>, mode: i32) {
+        if mode == 5 && bolts < self.displayed { *self = BoltRecent { displayed: bolts, ..BoltRecent::default() }; }
+        if delta.is_some() { self.hold = 0; }
+        if self.draining {
+            // RAC2's state 3: the total rolls to `target + accum` at `accum / 14` a tick for 16 ticks.
+            self.displayed += self.accum / BOLT_RECENT_DRAIN;
+            self.drain += 1;
+            if self.drain >= BOLT_RECENT_DRAIN_TICKS {
+                self.displayed = self.target + self.accum;
+                self.accum = 0;
+                self.draining = false;
+                self.hold = 0;
+            }
+        } else if bolts != self.displayed {
+            self.hold += 1;
+            if self.hold >= BOLT_RECENT_HOLD {
+                self.target = self.displayed;
+                self.accum = bolts - self.displayed;
+                self.drain = -1;
+                self.draining = true;
+            }
+        }
+    }
+
+    /// The pending amount (`g_boltCount − g_nBoltCounterDisplayed`): the number drawn under the total.
+    pub fn pending(&self, bolts: i32) -> i32 { bolts - self.displayed }
+
+    /// The alpha fraction: 1 while the pending amount holds, falling to 0 over the drain.
+    fn fade(&self) -> f32 {
+        if self.draining { 1.0 - (self.drain + 1) as f32 / (BOLT_RECENT_DRAIN_TICKS + 1) as f32 } else { 1.0 }
+    }
+}
+
 /// Per-tick game values the HUD elements read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Inputs {
@@ -513,6 +581,8 @@ pub struct HudState {
     pub health_anim: [i16; 4],
     /// 0x15fab8: bolt spin tick.
     pub bolt_anim: i16,
+    /// The "bolts picked up" element ([`BoltRecent`]): the rolling total and the pending amount drawn under it.
+    pub bolt_recent: BoltRecent,
     /// 0x15f970 / 0x15f96c: the weapon slot's request handle and item.
     weapon_handle: Option<u32>,
     /// The context prompt this tick (`PromptTick` 0x278eb8 / `NpcTalkUpdate`: an owner holds a message) and the
@@ -565,6 +635,7 @@ impl HudState {
             show_all: false,
             health_anim: [0; 4],
             bolt_anim: 0,
+            bolt_recent: BoltRecent::default(),
             weapon_handle: None,
             weapon_gate: 0,
             vendor_open: false,
@@ -687,12 +758,13 @@ impl HudState {
 
     /// `FUN_0024b090(handle, flags)`: replace the flags of the slot holding `handle`. Handles start at 1 and the empty
     /// slots hold 0, so only a slot holding an element matches (as [`HudState::keep_up`] / [`HudState::release`];
-    /// without the guard a handle 0, none yet, set an empty slot's flags).
-    pub fn set_flags(&mut self, handle: u32, flags: u32) {
-        if let Some(s) = self.slots.iter_mut().find(|s| s.handle == handle && s.last.element != Element::Empty) {
-            s.last.flags = flags;
-            if !s.pending { s.flags = flags; }
-        }
+    /// without the guard a handle 0, none yet, set an empty slot's flags). False when no slot holds `handle` (it was
+    /// re-armed after the caller took it).
+    pub fn set_flags(&mut self, handle: u32, flags: u32) -> bool {
+        let Some(s) = self.slots.iter_mut().find(|s| s.handle == handle && s.last.element != Element::Empty) else { return false };
+        s.last.flags = flags;
+        if !s.pending { s.flags = flags; }
+        true
     }
 
     /// `apply_pending_animation` + the element's init.
@@ -813,6 +885,7 @@ impl HudState {
         (self.vendor_open, self.vendor_sel, self.vendor_handle) = (false, None, None);
         self.bolts_pin_handle = None;
         self.prompt_show = false;
+        self.bolt_recent = BoltRecent { displayed: self.inputs.bolts, ..BoltRecent::default() };
     }
 
     /// The context prompt of this tick and its text (the engine: `moby_update::interact`).
@@ -944,20 +1017,29 @@ impl HudState {
         self.inputs = inputs;
         self.sounds.clear();
         self.vsync = self.vsync.wrapping_add(1);
+        // The vendor's bolt counter (OpenVendorMenu: slot 2 | 0x10; VendorExit: flags 0). Before the callers: a
+        // pickup on the vendor's exit tick re-queues slot 2, and the release must clear the pin's flags on the slot
+        // the pin still holds (the re-queue would replace its request and handle).
+        match (self.bolts_pinned, self.bolts_pin_handle) {
+            (true, None) => self.bolts_pin_handle = Some(self.queue(0x12, icon::BOLT_SLOT, Element::Bolts, 9_999_999)),
+            (false, Some(h)) => {
+                // The pin is slot 2 (`OpenVendorMenu`'s `0x12`). A pickup queued before this release (its call
+                // reaches the HUD before the tick) re-arms the slot and replaces the pin's handle; clear the flags
+                // on whichever request slot 2 holds now.
+                if !self.set_flags(h, 0) {
+                    let s = &mut self.slots[2];
+                    s.last.flags = 0;
+                    s.flags = 0;
+                }
+                self.bolts_pin_handle = None;
+            }
+            _ => {}
+        }
         self.frame_calls();
         // PromptTick 0x278eb8's slot part (and NpcTalkUpdate's): slot 12 requested, or kept up for 10 ticks.
         if self.prompt_show {
             let h = self.queue_req(Request::PROMPT);
             self.keep_up(h, scale_ticks(10));
-        }
-        // The vendor's bolt counter (OpenVendorMenu: slot 2 | 0x10; VendorExit: flags 0).
-        match (self.bolts_pinned, self.bolts_pin_handle) {
-            (true, None) => self.bolts_pin_handle = Some(self.queue(0x12, icon::BOLT_SLOT, Element::Bolts, 9_999_999)),
-            (false, Some(h)) => {
-                self.set_flags(h, 0);
-                self.bolts_pin_handle = None;
-            }
-            _ => {}
         }
         self.update_slots();
         let mut out = Vec::new();
@@ -977,13 +1059,22 @@ impl HudState {
     /// * `FUN_002d2450` (the Morph-o-Ray): a new target queues its meter; the request released (`fun_001ff480(+0x34)`)
     ///   when it stops firing.
     /// * The body's leave `0x231348`: Giant Clank's energy request `FUN_0024b090(0x140984, 0)`.
+    /// * The "bolts picked up" element ([`BoltRecent`], port-only): the bolt count's change feeds RAC2's
+    ///   `UpdateBoltCounterHud` 0x28a2f8 (the first tick snaps the total, as `ResetBoltCounterHud` does).
     fn frame_calls(&mut self) {
         let i = self.inputs;
+        let delta = self.last.and_then(|(_, bolts)| (i.bolts != bolts).then(|| i.bolts - bolts));
         if let Some((hp, bolts)) = self.last {
             if i.hp < hp { self.queue_req(Request::HEALTH); }
-            if i.bolts != bolts { self.queue_req(Request::BOLTS); }
+            // The counter's callers (`CollectBolt` 0x2a7e10, …) re-arm it on a change, but not while the vendor
+            // pins slot 2 (`OpenVendorMenu`): a request there would replace the pin's request and handle, so
+            // `VendorExit`'s `FUN_0024b090(handle, 0)` would no longer find the slot and flag 0x10 would keep the
+            // counter up forever.
+            if i.bolts != bolts && !self.bolts_pinned { self.queue_req(Request::BOLTS); }
         }
+        if self.last.is_none() { self.bolt_recent.displayed = i.bolts; }
         self.last = Some((i.hp, i.bolts));
+        self.bolt_recent.step(i.bolts, delta, i.mode);
         if i.pressed & crate::pad::button::L3 != 0 && i.hero_state != 0x1d && i.hero_state != crate::hero::scripted::MOUNTED { self.show_health_bolts(scale_ticks(180)); }
         if i.group == 0x11 && !i.o2_mask { self.queue_req(Request::OXYGEN); }
         if i.suck_active { self.queue_req(Request::SUCK_CANNON); }
@@ -1352,9 +1443,10 @@ impl HudState {
         let x = self.anchor(i).0;
         let (sf, f) = Self::fractions(s, BOLT_SLIDE_STEPS, BOLT_ALPHA_STEPS);
         let bar_a = ((sf * 128.0) as i32 as f32 * 0.7) as i32;
-        let bolts = self.inputs.bolts;
+        // The total is the rolling count (RAC2's `g_nBoltCounterDisplayed`), not the real one.
+        let shown = self.bolt_recent.displayed;
         let mut digits = 1;
-        let mut v = bolts;
+        let mut v = shown;
         while v > 9 {
             digits += 1;
             v /= 10;
@@ -1368,7 +1460,7 @@ impl HudState {
         self.hud_frame(i, self.assets.icon_frame(icon::BOLT, (self.bolt_anim as i32) >> 1), x - 32, y, 0, 0x80, out);
         let colour = tween_color(f, TEXT_FROM, TEXT_TO);
         let shadow = tween_color(f, 0, 0x8000_0000);
-        let number = bolts.to_string().into_bytes();
+        let number = shown.to_string().into_bytes();
         let (tx, ty) = (x + BOLT_TEXT_D.0, y + BOLT_TEXT_D.1);
         self.text_right(tx + 1, ty + 1, shadow, &number, out);
         self.text_right(tx, ty, colour, &number, out);
@@ -1379,6 +1471,18 @@ impl HudState {
             self.text_right(x + dx - DIGIT_W * k + 2, y + dy + 2, shadow, sep, out);
             self.text_right(x + dx - DIGIT_W * k, y + dy, colour, sep, out);
             k += 3;
+        }
+        // The "bolts picked up" element (RAC2's `UpdateBoltCounterHud` 0x28a2f8, port-only): the pending amount,
+        // right-aligned with the total, under the bar. A gain takes the total's colour; a spend is red, with the
+        // minus sign `to_string` writes. It fades out over its roll into the total ([`BoltRecent::fade`]).
+        let pending = self.bolt_recent.pending(self.inputs.bolts);
+        if pending != 0 {
+            let number = pending.to_string().into_bytes();
+            let (from, to) = if pending > 0 { (TEXT_FROM, TEXT_TO) } else { (EMPTY_FROM, EMPTY_TO) };
+            let g = f * self.bolt_recent.fade();
+            let (recent_colour, recent_shadow) = (tween_color(g, from, to), tween_color(g, 0, 0x8000_0000));
+            self.text_right(tx + 1, BOLT_RECENT_Y + 1, recent_shadow, &number, out);
+            self.text_right(tx, BOLT_RECENT_Y, recent_colour, &number, out);
         }
     }
 
@@ -2133,20 +2237,127 @@ mod tests {
             let mut h = HudState::new(assets());
             h.tick(Inputs { lang, ..inputs(4, 0) });
             let mut d = Vec::new();
-            for _ in 0..20 { d = h.tick(Inputs { lang, ..inputs(4, 1_234_567) }); }
+            for _ in 0..80 { d = h.tick(Inputs { lang, ..inputs(4, 1_234_567) }); }
             let t = texts(&d);
             // Number: shadow + text, right-aligned at x − 32 (width 7 × 13).
             assert_eq!(t[1], (492 - 32 - 91, 18 + 8, b"1234567".to_vec()));
             assert_eq!(t[0], (492 - 32 - 91 + 1, 18 + 8 + 1, b"1234567".to_vec()));
-            // Separators after the 3rd and 6th digit from the right: shadow at +2, +2.
+            // Separators after the 3rd and 6th digit from the right: shadow at +2, +2. (The single-byte
+            // draws: the total and the "bolts picked up" number are wider.)
             let w = if sep == b'.' { 6 } else { 4 };
-            let seps: Vec<_> = t[2..].to_vec();
+            let seps: Vec<_> = t.iter().filter(|(_, _, s)| s.len() == 1).cloned().collect();
             assert_eq!(seps.len(), 4);
             for (j, k) in [3, 6].into_iter().enumerate() {
                 assert_eq!(seps[2 * j], (492 + dx - 13 * k + 2 - w, 18 + dy + 2, vec![sep]));
                 assert_eq!(seps[2 * j + 1], (492 + dx - 13 * k - w, 18 + dy, vec![sep]));
             }
         }
+    }
+
+    /// The "bolts picked up" element (RAC2 `UpdateBoltCounterHud` 0x28a2f8, port-only): the total rolls to the real
+    /// count, and the pending amount holds 61 ticks after its last change before rolling in over 16 ticks.
+    #[test]
+    fn bolt_recent_holds_then_rolls_the_total() {
+        let mut h = HudState::new(assets());
+        h.tick(inputs(4, 0));
+        h.tick(inputs(4, 5));
+        // The total snapped to 0 on the first tick; the pickup is pending, the total still 0.
+        assert_eq!((h.bolt_recent.displayed, h.bolt_recent.pending(5)), (0, 5));
+        // 59 more ticks: still holding (the change tick counted 1).
+        for _ in 0..59 { h.tick(inputs(4, 5)); }
+        assert_eq!((h.bolt_recent.displayed, h.bolt_recent.draining), (0, false));
+        h.tick(inputs(4, 5));
+        assert!(h.bolt_recent.draining, "the roll starts 61 ticks after the change");
+        // 5 / 14 = 0 a tick, so the total only moves at the roll's end, 16 ticks later.
+        for _ in 0..15 { h.tick(inputs(4, 5)); }
+        assert_eq!(h.bolt_recent.displayed, 0);
+        h.tick(inputs(4, 5));
+        assert_eq!((h.bolt_recent.displayed, h.bolt_recent.pending(5)), (5, 0));
+    }
+
+    /// A large pending amount rolls the total at `accum / 14` a tick.
+    #[test]
+    fn bolt_recent_rolls_at_a_fourteenth() {
+        let mut h = HudState::new(assets());
+        h.tick(inputs(4, 0));
+        h.tick(inputs(4, 10));
+        h.tick(inputs(4, 30)); // +20 more
+        assert_eq!(h.bolt_recent.pending(30), 30);
+        for _ in 0..60 { h.tick(inputs(4, 30)); }
+        assert!(h.bolt_recent.draining);
+        h.tick(inputs(4, 30));
+        assert_eq!(h.bolt_recent.displayed, 2, "30 / 14 = 2 a tick");
+        h.tick(inputs(4, 30));
+        assert_eq!(h.bolt_recent.displayed, 4);
+    }
+
+    /// The vendor (mode 5) snaps the total to the real count when it is ahead (`ResetBoltCounterHud`).
+    #[test]
+    fn bolt_recent_snaps_at_the_vendor() {
+        let mut h = HudState::new(assets());
+        h.tick(inputs(4, 100));
+        h.tick(inputs(4, 105));
+        assert_eq!(h.bolt_recent.pending(105), 5);
+        // A spend leaves the total ahead of the real count; mode 5 snaps it.
+        h.tick(Inputs { mode: 5, ..inputs(4, 95) });
+        assert_eq!((h.bolt_recent.displayed, h.bolt_recent.pending(95)), (95, 0));
+    }
+
+    /// The pending amount is drawn under the rolling total, right-aligned with it, in the total's own colour.
+    #[test]
+    fn bolt_recent_draws_under_the_total() {
+        let mut h = HudState::new(assets());
+        h.tick(inputs(4, 0));
+        let mut d = Vec::new();
+        for _ in 0..20 { d = h.tick(inputs(4, 37)); }
+        let t = texts(&d);
+        // The total is still 0 (the roll waits out the hold); the pending 37 sits under it at the same edge.
+        assert!(t.contains(&(492 - 32 - 13, 18 + 8, b"0".to_vec())), "{t:?}");
+        assert!(t.contains(&(492 - 32 - 26, BOLT_RECENT_Y, b"37".to_vec())), "{t:?}");
+        let recent = d.iter().find_map(|x| match x {
+            Draw::Text { y, rgba, text, .. } if *y == BOLT_RECENT_Y && *text == b"37".to_vec() => Some(*rgba),
+            _ => None,
+        });
+        assert_eq!(recent, Some(TEXT_TO), "the total's own tween");
+    }
+
+    /// A spend shows as a red number with a minus sign.
+    #[test]
+    fn bolt_recent_shows_a_spend_in_red() {
+        let mut h = HudState::new(assets());
+        h.tick(inputs(4, 100));
+        h.tick(inputs(4, 95));
+        let mut d = Vec::new();
+        for _ in 0..20 { d = h.tick(inputs(4, 95)); }
+        let recent = d.iter().find_map(|x| match x {
+            Draw::Text { y, rgba, text, .. } if *y == BOLT_RECENT_Y => Some((*rgba, text.clone())),
+            _ => None,
+        });
+        assert_eq!(recent, Some((EMPTY_TO, b"-5".to_vec())));
+    }
+
+    /// A spend at the vendor does not re-arm the counter (only `CollectBolt` does), so the vendor's pin handle stays
+    /// valid: its exit clears flag 0x10 and the counter hides once the total has rolled up, even when a pickup
+    /// arrives on the exit tick.
+    #[test]
+    fn bolt_counter_hides_after_a_vendor_spend() {
+        let mut h = HudState::new(assets());
+        for _ in 0..30 { h.tick(inputs(4, 100)); }
+        // The vendor opens: mode 5, slot 2 pinned.
+        h.bolts_pinned = true;
+        for _ in 0..30 { h.tick(Inputs { mode: 5, ..inputs(4, 100) }); }
+        assert_eq!((h.slots[2].slide, h.slots[2].flags), (8, 0x10));
+        // Buying snaps the rolling total (mode 5) and leaves the pinned request in place.
+        for _ in 0..30 { h.tick(Inputs { mode: 5, ..inputs(4, 95) }); }
+        assert_eq!((h.bolt_recent.displayed, h.slots[2].flags), (95, 0x10));
+        // The vendor exits on the tick a pickup arrives: `CollectBolt`'s queue reaches the HUD before the tick
+        // (the game's call log is applied first), so slot 2 is re-armed before the release.
+        h.bolts_pinned = false;
+        h.apply_calls(&[Call::Queue(Request::BOLTS)]);
+        h.tick(inputs(4, 96));
+        assert_eq!(h.slots[2].flags, 0, "the exit clears the pin");
+        for _ in 0..400 { h.tick(inputs(4, 96)); }
+        assert_eq!((h.slots[2].slide, h.bolt_recent.pending(96)), (0, 0), "the counter hides");
     }
 
     #[test]
