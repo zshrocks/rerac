@@ -360,8 +360,9 @@ pub fn hold_special(h: &Hero, seq: u8, frame: f32) -> Option<f32> {
 ///   not blending): a new sequence while he blends is taken as key B over his blend's t from the layer's last key;
 ///   when the layer is itself between two sequences it first finishes that blend at 0.15 a tick (+0x30);
 /// * in the special poses of [`hold_special`] it blends to the holding class's sequence 0 over `ticks(15)` and plays
-///   it (speed 1), and on the way out blends back to his sequence at 0.1 a tick (+0x32 / +0x33); a pose's arm angle
-///   is the pitch target of the joint records 8 and 9 (0x17b0e4 / 0x17b194, both arms);
+///   it (speed 1), and on the way out blends back to the new sequence's first frame (the shot's recoil kick) at 0.1 a
+///   tick (+0x32 / +0x33), then crossfades from that frame to his live key over 10 ticks (the node's `settle`); a
+///   pose's arm angle is the pitch target of the joint records 8 and 9 (0x17b0e4 / 0x17b194, both arms);
 /// * its advance (`FUN_00263f70`, speed 0 outside the special poses: no key steps of its own).
 ///
 /// `FUN_0022def8`'s 0xff → Ratchet +0xa5 mapping never applies: the layer copies key A only when Ratchet is not
@@ -418,7 +419,21 @@ pub fn hold_update(h: &mut Hero, anim: &dyn AnimCtl) {
                 j.target[1] = a;
             }
         }
-        if !special && !l.special {
+        if l.settle && !special {
+            // The exit reached the special pose's target key (the shot's recoil frame, the game's `+0x21 = 0`), which
+            // the layer held while blending out of the holding pose. Ratchet's animation has moved on by then, so
+            // crossfade from that recoil key to his live one instead of snapping to it: the kick shows and the
+            // return to the default pose stays smooth (the PS2's hand-over).
+            l.seq_b = v.seq_b;
+            l.frame_b = v.frame_b;
+            l.t = (l.t + 0.1).min(1.0);
+            if l.t == 1.0 {
+                l.seq_a = l.seq_b;
+                l.frame_a = l.frame_b;
+                l.settle = false;
+                l.special = false;
+            }
+        } else if !special && !l.special {
             if !l.own_blend {
                 if steady { l.seq_a = v.seq_a; }
                 l.seq_b = v.seq_b;
@@ -434,16 +449,24 @@ pub fn hold_update(h: &mut Hero, anim: &dyn AnimCtl) {
                 }
             }
         } else if !special {
-            // Out of the special poses: back to his key B from frame 0 over 10 ticks.
+            // Out of the special poses: back to the shot's first frame (the recoil kick) over 10 ticks.
+            l.seq_b = v.seq_b;
             if !l.back {
-                l.seq_b = v.seq_b;
                 l.frame_b = 0;
                 l.back = true;
                 l.t = 0.0;
                 l.speed = 0.0;
             } else {
                 l.t = (l.t + 0.1).min(1.0);
-                if l.t == 1.0 { l.special = false; }
+                if l.t == 1.0 {
+                    // The kick is on screen (key A frames later); hand over from it in the settle phase.
+                    l.seq_a = l.seq_b;
+                    l.frame_a = l.frame_b;
+                    l.seq_b = v.seq_b;
+                    l.frame_b = v.frame_b;
+                    l.t = 0.0;
+                    l.settle = true;
+                }
             }
         } else {
             if !l.special || l.seq_b != 0 {
@@ -458,6 +481,7 @@ pub fn hold_update(h: &mut Hero, anim: &dyn AnimCtl) {
                 l.special = true;
                 l.back = false;
             }
+            l.settle = false;
             l.speed = 1.0;
         }
         l.advance(anim);
@@ -908,6 +932,57 @@ mod tests {
         r.hero.f13ff = 1;
         for _ in 0..12 { hold_update(&mut r.hero, &r.anim); }
         assert!(r.hero.weapons.layers[HOLD..FACE].iter().all(Option::is_none));
+    }
+
+    /// `0x22e660`'s way out of the special poses: the holding layer blends to the shot's first frame (the recoil kick)
+    /// over 10 ticks, then crossfades from that kick to Ratchet's live key. Freezing key B there and snapping to his
+    /// key (what the exit does literally) pops the arm 8.5° in one tick on ice; tracking his key through the whole exit
+    /// instead hides the kick (the Devastator would not swing out at all).
+    #[test]
+    fn special_exit_keeps_the_kick_and_settles_on_his_key() {
+        let mut r = Runner::new([0.0; 3], 0.0);
+        r.anim.set_anim(Pf::ONE, 0x6e, 0);
+        r.anim.advance(Pf::ONE);
+        r.hero.items.f13fb = 2;
+        for _ in 0..12 { hold_update(&mut r.hero, &r.anim); }
+        assert!(r.hero.weapons.layers[HOLD].is_some_and(|l| l.special && l.seq_b == 0), "the ice idle is a special pose");
+        // The Devastator's standing shot 0x36: he blends into it (its frame 1) over 10 ticks.
+        r.anim.v.seq_a = 0x6e;
+        r.anim.v.seq_b = 0x36;
+        r.anim.v.frame_b = 1;
+        for i in 1..=10 {
+            r.anim.v.t = ((i - 1) as f32 * 0.1).min(0.9);
+            hold_update(&mut r.hero, &r.anim);
+            let l = r.hero.weapons.layers[HOLD].unwrap();
+            assert_eq!((l.seq_b, l.frame_b), (0x36, 0), "tick {i}: the exit holds the shot's first frame, {l:?}");
+            assert!(l.back && l.special && !l.settle, "tick {i}: still blending out, {l:?}");
+        }
+        // The kick is on screen: the exit hands over to the settle phase, from that frame to his live key.
+        hold_update(&mut r.hero, &r.anim);
+        let l = r.hero.weapons.layers[HOLD].unwrap();
+        assert_eq!((l.seq_a, l.frame_a, l.seq_b, l.frame_b, l.t), (0x36, 0, 0x36, 1, 0.0), "{l:?}");
+        assert!(l.settle && l.special, "{l:?}");
+        // He is steady on the shot now, its frames moving on; the settle crossfades to his live frame.
+        r.anim.v.seq_a = 0x36;
+        r.anim.v.frame_a = 1;
+        r.anim.v.frame_b = 2;
+        r.anim.v.t = 0.0;
+        for i in 1..=10 {
+            hold_update(&mut r.hero, &r.anim);
+            let l = r.hero.weapons.layers[HOLD].unwrap();
+            assert_eq!((l.seq_b, l.frame_b), (0x36, 2), "tick {i}: {l:?}");
+            assert!((l.t - i as f32 * 0.1).abs() < 1e-6, "tick {i}: {l:?}");
+        }
+        let l = r.hero.weapons.layers[HOLD].unwrap();
+        assert_eq!((l.seq_a, l.frame_a), (0x36, 2), "settled on his key");
+        assert!(!l.settle && !l.special, "{l:?}");
+        // The normal follow: his key A / B and t, no further blend.
+        r.anim.v.frame_a = 2;
+        r.anim.v.frame_b = 3;
+        r.anim.v.t = 0.5;
+        hold_update(&mut r.hero, &r.anim);
+        let l = r.hero.weapons.layers[HOLD].unwrap();
+        assert_eq!((l.seq_a, l.frame_a, l.seq_b, l.frame_b, l.t), (0x36, 2, 0x36, 3, 0.5), "{l:?}");
     }
 
     /// ○ while running: the weapon arm (0x1413f8), not the state; its timer 0x13f50c counts.

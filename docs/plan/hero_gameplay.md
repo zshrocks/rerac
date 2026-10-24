@@ -784,8 +784,13 @@ then the face layer `0x22e3a8`). Per layer i (0 → node 0x140050 on joint list 
   not blending, `FUN_0022def8` would map a 0xff key A to his +0xa5 but that never happens). When he blends into a new
   sequence while the node is itself between two sequences, it first finishes its own blend at 0.15 a tick (+0x30).
   In the special poses (`0x22df10`: his key B 0x1c / 0x1d / 0x1f, 0x31 / 0x32, 0x37, 0x4a / 0x4b, 0x50, 0x60, 0x6d /
-  0x6e) it blends to sequence 0 frame 0 over `ticks(15)` and plays it (speed 1); out of them it blends back to his key
-  B from frame 0 at 0.1 a tick (+0x32 / +0x33).
+  0x6e) it blends to sequence 0 frame 0 over `ticks(15)` and plays it (speed 1); out of them it blends back to the
+  new sequence's first frame at 0.1 a tick (+0x32 / +0x33). **The exit then settles onto his live key** (a port-only
+  10-tick crossfade from that first frame to his live key, the node's `settle`): the first frame is the shot's recoil
+  kick, and his animation has moved on by the time the blend reaches it, so snapping to his key there jerks the arm
+  (the Devastator's standing shot out of the ice idle 0x6e popped it 8.5° in one tick), while tracking his key through
+  the blend instead hides the kick (no swing-out at all). `weapons::tests::special_exit_keeps_the_kick_and_settles_on_his_key`
+  holds both halves. [H for the exit's flags and rate; the kick and the settle are the PS2's observed behaviour.]
 * **the data**: a key on a sequence below 0x17 is read from the node's class (`FUN_00263f70` sets +6 / +7 and calls
   `FUN_00264220`), any other from Ratchet's own. Classes 1 and 2 are animation-only (no mesh), 20 joints each, 23
   sequences with the frame counts and key times of Ratchet's sequences 0..0x16 (seq 17: 27 frames against his 25); the
@@ -837,7 +842,9 @@ Native `f32`; no hardware modelling.
 `FUN_00263e08` links); 0x15ed60 = 1 (NTSC).
 
 **Tests**: `weapons::tests::holding_layers` (per 0x1413fb, the fade under the arm layer, the special pose, the hidden
-hand), `targeting::tests::missile_mark_is_bounded`, `audio::tests::loud_mix_clamps_without_overflow`;
+hand), `weapons::tests::special_exit_keeps_the_kick_and_settles_on_his_key` (the way out of a special pose keeps the
+shot's kick and settles onto his key), `targeting::tests::missile_mark_is_bounded`,
+`audio::tests::loud_mix_clamps_without_overflow`;
 `hero_guns_novalis`: `novalis_holding_layers_per_item` (Devastator / R.Y.N.O. two layers, Blaster one, Bomb Glove none,
 following the run at weight 1), `novalis_weapon_steady_while_running` (running 60 ticks: barrel pitch spread 13.1°,
 yaw 7.2°, height 0.16 with the holding classes against 97.9° / 124.9° / 0.30 without), `novalis_standing_fire_then_run`

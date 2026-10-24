@@ -166,6 +166,10 @@ pub struct AnimLayer {
     /// +0x32 / +0x33: in (or leaving) the special poses of `0x22df10`; the way back has started.
     pub special: bool,
     pub back: bool,
+    /// Port-only: the exit blend reached the special pose's target key (the shot's recoil frame) and now
+    /// crossfades from it to Ratchet's live key, so the hand-over is continuous instead of a snap
+    /// (`crate::hero::weapons::hold_update`).
+    pub settle: bool,
     /// +0x34: fading out for good (the hand item hidden, 0x1413ff).
     pub kill: bool,
     /// The node's place in the moby's +0x60 list: `FUN_00263e08` links a new node in front, so a later one is
