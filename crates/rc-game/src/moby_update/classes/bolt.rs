@@ -550,18 +550,22 @@ pub fn collect(w: &mut World, id: MobyId) {
         let m = w.m(id);
         (m.o_class, m.pvars.get(0x40).copied().unwrap_or(0), m.parent, pv(m.position))
     };
-    let val = value(o_class);
+    let base = value(o_class);
+    // RAC2's challenge-mode multiplier: the credited value scales, the coin (and the spawner's dropped count)
+    // stays the ordinary one.
+    let val = w.svc.counters.bolt_value(base);
     let lvl = w.svc.level;
     if let Some(par) = parent {
         let b1 = w.m(par).spawn_flag;
         if b1 & 0x80 == 0 {
             let e = w.svc.counters.spawner_bolts.entry((lvl, b1)).or_default();
-            *e = e.wrapping_add(val as i16);
+            *e = e.wrapping_add(base as i16);
         }
     }
     w.svc.counters.bolts += val;
     if challenge != 0 || (w.svc.counters.challenge_on != 0 && id < w.table.first_dynamic) {
-        w.svc.counters.challenge_bolts += val;
+        // The farm limiter's input stays the ordinary rate, as the multiplier scales only the credit.
+        w.svc.counters.challenge_bolts += base;
     }
     w.svc.counters.level_bolts[(lvl as usize).min(19)] += val;
     w.svc.counters.hud_bolt_refresh += 1;
@@ -592,7 +596,8 @@ pub fn spawn(w: &mut World, src: MobyId, pos: V4, vel: V4, flags: u32, value: i3
         _ => (13, Pf::b(0x3f26_6666)),
     };
     let Some(b) = w.create_moby(class) else {
-        w.svc.counters.bolts += value;
+        let v = w.svc.counters.bolt_value(value);
+        w.svc.counters.bolts += v;
         return None;
     };
     let mut root = src;
@@ -741,5 +746,32 @@ mod tests {
         let n = (r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2]).sqrt();
         let expect = [0.1 + dt * r0[0] / n, dt * r0[1] / n, dt + dt * r0[2] / n];
         assert!((0..3).all(|k| (v[k] - expect[k]).abs() < 1e-6), "{v:?} vs {expect:?}");
+    }
+
+    /// The pickup credits the RAC2 challenge-mode multiplier (never outside it) while the dropper's count and the
+    /// farm limiter's input stay the ordinary value.
+    #[test]
+    fn collect_scales_the_credit_in_challenge_mode() {
+        let run = |times_completed: i32, level: i32| -> (i32, i16) {
+            let mut par = Moby { o_class: 707, pvars: vec![0; 0x80], ..Moby::default() };
+            par.spawn_flag = 3;
+            // Class 15 is a 20-bolt coin.
+            let b = Moby { o_class: 15, state: 3, pvars: vec![0; 0x80], parent: Some(0), ..Moby::default() };
+            let mut t = MobyTable::new(vec![par, b], 0);
+            let hero = crate::hero::Hero::new();
+            let mut rng = crate::rng::Rng::new();
+            let classes = crate::moby_update::ClassTable::default();
+            let mut svc = Services::new();
+            svc.level = 0;
+            svc.counters.times_completed = times_completed;
+            svc.counters.bolt_multiplier.level = level;
+            {
+                let mut w = World::new(&mut t, &hero, &mut rng, &classes, &mut svc, 1);
+                collect(&mut w, 1);
+            }
+            (svc.counters.bolts, svc.counters.spawner_bolts.get(&(0, 3)).copied().unwrap_or(0))
+        };
+        assert_eq!(run(0, 5), (20, 20), "outside challenge mode the level is ignored");
+        assert_eq!(run(1, 5), (100, 20), "×5 credits 100; the dropper's count stays 20");
     }
 }

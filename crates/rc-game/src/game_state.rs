@@ -9,7 +9,8 @@
 //! [`GameState::from_save_file`] is byte-exact for every file the game writes (pad bytes included).
 //!
 //! Session-only fields (not saved: the hero block 0x13f350..0x141660 incl. HP, the PAL tick scale) live in
-//! [`SessionState`].
+//! [`SessionState`]; [`GameState::bolt_multiplier`] is the exception that rides the whole state across planet
+//! changes (the level start clears the session, but the challenge run's multiplier must survive a transition).
 //!
 //! Ported code, L01 = level01 overlay, boot addresses in brackets:
 //! * `RestoreData` 0x20af20 → [`GameState::restore`]; `RestoreGame` 0x209298 → [`GameState::load_card_file`];
@@ -348,6 +349,8 @@ impl Options {
     }
 }
 
+use crate::moby_update::services::BoltMultiplier;
+
 /// The whole persistent state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GameState {
@@ -360,6 +363,11 @@ pub struct GameState {
     pub raw: BTreeMap<(Scope, i32), Vec<u8>>,
     /// Non-zero pad bytes of restored chunks, re-emitted by [`GameState::to_save_file`].
     pub pads: BTreeMap<(Scope, i32), Vec<u8>>,
+    /// RAC2's challenge-mode bolt multiplier (port-only, **not saved**): it follows the running game across planet
+    /// changes, so it lives here rather than in the per-level [`Services`](crate::moby_update::services::Services).
+    /// A new game, a load or a time warp restore starts it again; an in-level death resets it through the hero's
+    /// damage events.
+    pub bolt_multiplier: BoltMultiplier,
 }
 
 fn align4(n: usize) -> usize { (n + 3) & !3 }
@@ -367,7 +375,7 @@ fn align4(n: usize) -> usize { (n + 3) & !3 }
 impl GameState {
     /// All chunks zero (the RAM before a restore).
     pub fn zeroed(tables: ChunkTables) -> GameState {
-        GameState { tables, global: Global::zeroed(), levels: (0..LEVEL_SLOTS).map(|_| LevelState::zeroed()).collect(), raw: BTreeMap::new(), pads: BTreeMap::new() }
+        GameState { tables, global: Global::zeroed(), levels: (0..LEVEL_SLOTS).map(|_| LevelState::zeroed()).collect(), raw: BTreeMap::new(), pads: BTreeMap::new(), bolt_multiplier: BoltMultiplier::default() }
     }
 
     /// New game (`load_and_initialize_level_chunk` 0x209370): restore the disc template
@@ -416,6 +424,8 @@ impl GameState {
     /// equals the word after the terminator in its buffer; that stale word is not modelled.)
     pub fn restore_section(&mut self, scope: Scope, sec: &Section) -> u32 {
         if !sec.crc_ok { return 1; }
+        // A load (and the time warp) starts the challenge run's multiplier again: it is not part of the save.
+        if scope == Scope::Global { self.bolt_multiplier.reset(); }
         let descs = self.descs(scope).to_vec();
         let mut status = vec![0i32; descs.len()];
         let (mut errors, mut sum) = (0u32, 8usize);
@@ -759,6 +769,33 @@ mod tests {
         let before = s.clone();
         assert_eq!(s.restore_section(Scope::Global, &bad), 1);
         assert_eq!(s, before, "a bad CRC restores nothing");
+    }
+
+    /// RAC2's challenge-mode multiplier rides the game state across planet starts, is not saved, and a load resets it.
+    #[test]
+    fn bolt_multiplier_crosses_planets_but_not_saves() {
+        use rc_formats::save_game::{ItemRecord, ItemTables, ITEM_COUNT, VENDOR_TABLE_LEN};
+        let items = ItemTables {
+            vendor_items: [0; VENDOR_TABLE_LEN],
+            records: [ItemRecord([0; 0x18]); ITEM_COUNT],
+            slot_type: [0; ITEM_COUNT],
+            item_defs_addr: 0,
+        };
+        let mut s = GameState::zeroed(tables());
+        for _ in 0..6 { s.bolt_multiplier.kill(); }
+        assert_eq!(s.bolt_multiplier.level, 5);
+        s.global.owned[8] = 1;
+        s.global.vendor = [0xff; 12];
+        let mut session = SessionState::default();
+        s.apply_level_start(1, &items, &mut session);
+        assert_eq!(s.bolt_multiplier.level, 5, "a planet start keeps the streak");
+        let bytes = s.to_save_file().to_bytes();
+        let (back, r) = GameState::from_save_file(tables(), &SaveFile::parse(&bytes).unwrap());
+        assert_eq!(r.total(), 0);
+        assert_eq!(back.bolt_multiplier, BoltMultiplier::default(), "not saved: a load starts at ×1");
+        let sec = s.global_section();
+        s.restore_section(Scope::Global, &sec);
+        assert_eq!(s.bolt_multiplier, BoltMultiplier::default(), "a load restores ×1");
     }
 
     #[test]
