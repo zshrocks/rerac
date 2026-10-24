@@ -914,7 +914,17 @@ fn upload(
         }
         let at = item.base as usize * 64;
         for (k, b) in f.iter().take(item.slots as usize).flat_map(|r| r.iter().flatten().flat_map(|v| v.to_le_bytes())).enumerate() { palette[at + k] = b; }
-        let lights: Option<light::MobyLights> = lighting.map(|l| light::moby_lights(&item.rows, &l.bank, a.host_light, a.host_ambient, 0x80));
+        // A gold weapon in hand takes light set 12 and a warm ambient derived from Ratchet's own
+        // (`update_item_tint_from_hero` 0x207330, from `update_hero_color_and_item_tint` 0x2078a8: ambient
+        // (4s/10, 3s/10, 0), s = the hero ambient's channel sum; set 12 is an empty set, so the body goes
+        // flat gold while the metal shines with the gold map).
+        let (word, ambient) = if item.gold {
+            let s = a.host_ambient.iter().map(|&c| c as i32).sum::<i32>();
+            (0x0c0c, [(s * 4 / 10) as u8, (s * 3 / 10) as u8, 0])
+        } else {
+            (a.host_light, a.host_ambient)
+        };
+        let lights: Option<light::MobyLights> = lighting.map(|l| light::moby_lights(&item.rows, &l.bank, word, ambient, 0x80));
         let model = model_of(item);
         let mut rec = moby_render::extra_record(&model, lights.as_ref(), item.base);
         // The point lights (explosions, the Pyrocitor) reach the items as they reach every moby MobyProc draws
