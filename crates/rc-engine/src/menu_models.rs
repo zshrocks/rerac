@@ -743,7 +743,21 @@ fn update(
         for (i, b) in pl.pose.iter().take(p.slots as usize).flat_map(|r| r.iter().flatten().flat_map(|v| v.to_le_bytes())).enumerate() {
             if let Some(d) = palette.get_mut(at + i) { *d = b; }
         }
-        let lights = rt.bank.as_ref().map(|bank| moby_light::moby_lights(&pl.rows, bank, frame::LIGHT_WORD, frame::AMBIENT, 0x80));
+        // A gold weapon's preview is tinted the way `update_item_tint_from_hero` (0x207330) tints the held
+        // weapon: a warm ambient (4s/10, 3s/10, 0) off the hero ambient's channel sum s, on top of the menu's
+        // own light (set 14; the game's light set 12 is an empty set).
+        let gold = p.gold == Some(true) && matches!(p.role, Role::Hand | Role::Item);
+        let (word, ambient) = if gold {
+            let s = play
+                .as_ref()
+                .and_then(|q| q.game.mobys.mobys.get(q.game.hero_moby))
+                .map(|m| m.ambient.iter().take(3).map(|&c| c as i32).sum::<i32>())
+                .unwrap_or_else(|| frame::AMBIENT.iter().map(|&c| c as i32).sum());
+            (frame::LIGHT_WORD, [(s * 4 / 10) as u8, (s * 3 / 10) as u8, 0])
+        } else {
+            (frame::LIGHT_WORD, frame::AMBIENT)
+        };
+        let lights = rt.bank.as_ref().map(|bank| moby_light::moby_lights(&pl.rows, bank, word, ambient, 0x80));
         let model = fold * moby_render::extra_model(rows_f32(&pl.rows), p.scale, pl.pos);
         let r = moby_render::extra_record(&model, lights.as_ref(), p.base);
         let o = k * moby_render::EXTRA_RECORD_SIZE;
