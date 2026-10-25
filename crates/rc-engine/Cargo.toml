@@ -17,6 +17,9 @@ dev = ["bevy/dynamic_linking"]
 
 [dependencies]
 bevy = "0.19"
+# The audio output is ours (crate::audio_out): rodio directly, so a dead stream can be reopened. bevy_audio's
+# AudioOutput is private and cpal 0.17 leaves an ALSA stream dead after a POLLERR underrun.
+rodio = { version = "0.22", default-features = false, features = ["playback"] }
 rc-formats = { path = "../rc-formats" }
 rc-game = { path = "../rc-game" }
 # Going Commando's game logic (crate::rac2).

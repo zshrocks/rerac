@@ -1,5 +1,5 @@
 //! Audio output: the game's audio (`rc_game::audio`: sound slots, 989snd, music, software SPU2) run once per
-//! 60 Hz game tick and played through Bevy's audio as one endless rodio source (docs/plan/audio.md §6.7).
+//! 60 Hz game tick and played through rodio as one endless source (docs/plan/audio.md §6.7).
 //!
 //! * **With the game tick** (crate::gameplay): the sound layer is part of the tick
 //!   (`rc_game::audio::class_sounds`): the moby loop's class sounds get their slot during the moby loop, and
@@ -19,9 +19,15 @@
 //!   camera, then renders exactly 800 samples (48 kHz stereo).
 //! * The mix is a pure function of the tick sequence and those inputs, so frame-exact runs give identical
 //!   audio. `RC_AUDIO=0` removes the sound layer's draws from the game stream (the game without sound).
-//! * The samples go to a ring buffer read by [`MixerDecoder`], a `rodio::Source` behind the `Decodable` asset
-//!   [`MixerStream`] (bevy_audio 0.19, `add_audio_source`). The reader waits for 50 ms of audio before it
-//!   starts (and again after an underrun, outputting silence meanwhile); the ring is capped at 0.25 s.
+//! * The samples go to a ring buffer read by [`MixerDecoder`], a `rodio::Source` appended to our own output
+//!   [`Output`]. The reader waits for 50 ms of audio before it starts (and again after an underrun, outputting
+//!   silence meanwhile); the ring is capped at 0.25 s.
+//! * The output device is ours rather than bevy_audio's: a cpal 0.17 ALSA stream is dead for good after an
+//!   underrun the PipeWire ALSA plugin reports as `POLLERR` (cpal's worker logs and spins instead of
+//!   `snd_pcm_prepare`; rodio 0.22 pins cpal 0.17, so bevy_audio 0.19 inherits it). A heavily loaded CPU (a
+//!   build or a test run) underruns the 50 ms buffer, and without this the game would lose sound until
+//!   restarted. [`Output`] therefore watches the device ([`output_watchdog`]) and reopens it when it stops
+//!   taking samples with frames still waiting, or after an open failure.
 //! * The underwater flag 0x167494 comes from crate::fog_state (`UnderwaterTest` 0x20e9f0 in its camera update, which
 //!   runs after the frame's ticks: the sound step reads the flag of the previous frame's camera, one tick late
 //!   [L]); [`sync_underwater`] copies it into the audio system before the tick. The reverb (zones and effect:
@@ -41,15 +47,14 @@
 //!   1024 from the boot data), e.g. `RC_AUDIO_MUSIC=0` to hear or record the effects alone.
 
 use crate::determinism::GameTicks;
-use bevy::audio::{AddAudioSource, AudioPlayer, ChannelCount, Decodable, SampleRate, Source};
 use bevy::prelude::*;
-use bevy::reflect::TypePath;
 use rc_formats::level::LevelCore;
 use rc_game::audio::{self, AudioSystem, FrameInput, LevelAudio};
+use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, Player, SampleRate, Source};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// `RC_AUDIO` is not "0".
 pub fn enabled() -> bool { !std::env::var("RC_AUDIO").is_ok_and(|v| v.trim() == "0") }
@@ -87,6 +92,10 @@ pub fn load(root: &Path, index: u32, core_index: &[u8], core: &LevelCore, core_d
 const PREFILL: usize = 2400;
 /// Ring cap: 0.25 s (older frames are dropped when the game runs ahead of the device).
 const RING_CAP: usize = 12_000;
+/// A device that has taken no sample for this long, with frames waiting, is treated as dead and reopened.
+const STALL: Duration = Duration::from_secs(2);
+/// How long to wait before trying the output device again after a failed open.
+const RETRY: Duration = Duration::from_secs(2);
 /// `RC_AUDIO_WAV` length: 10 s unless `RC_AUDIO_WAV_SECONDS`.
 fn wav_frames() -> usize {
     let secs = std::env::var("RC_AUDIO_WAV_SECONDS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&s| s > 0).unwrap_or(10);
@@ -100,6 +109,9 @@ struct RingState {
     underruns: u64,
     /// Frames dropped at the cap (the game ran ahead of the device).
     dropped: u64,
+    /// Samples the device has taken, silence while it waits for the prefill included: a device that stops
+    /// incrementing it has stopped pulling ([`output_watchdog`]).
+    pulled: u64,
 }
 
 /// Rendered frames waiting for the audio device.
@@ -117,6 +129,7 @@ impl Ring {
 
     fn pop(&self) -> [i16; 2] {
         let mut r = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        r.pulled += 1;
         if !r.running {
             if r.frames.len() < PREFILL { return [0, 0]; }
             r.running = true;
@@ -130,12 +143,11 @@ impl Ring {
             }
         }
     }
-}
 
-/// The asset bevy_audio plays: a handle on the ring.
-#[derive(Asset, TypePath)]
-pub struct MixerStream {
-    ring: Arc<Ring>,
+    /// Samples taken so far, and frames still waiting.
+    fn progress(&self) -> (u64, usize) {
+        self.0.lock().map(|r| (r.pulled, r.frames.len())).unwrap_or((0, 0))
+    }
 }
 
 /// The rodio source: interleaved stereo f32 at 48 kHz, endless.
@@ -161,10 +173,73 @@ impl Source for MixerDecoder {
     fn total_duration(&self) -> Option<std::time::Duration> { None }
 }
 
-impl Decodable for MixerStream {
-    type Decoder = MixerDecoder;
-    fn decoder(&self) -> MixerDecoder { MixerDecoder { ring: Arc::clone(&self.ring), right: None } }
+/// The stream errors rodio's callback reported: cpal sends buffer underruns and device loss here, and cpal 0.17's
+/// ALSA worker keeps reporting an xrun it cannot recover from as `alsa::poll() returned POLLERR`.
+#[derive(Default)]
+struct ErrorLog {
+    count: u64,
+    last: Option<String>,
 }
+
+/// Our output device: the player reading [`MixerDecoder`] off the ring through rodio's device mixer, and the
+/// stream itself. Reopened by [`output_watchdog`] when cpal's ALSA stream dies under an underrun (module docs).
+struct Output {
+    /// The player, dropped before the sink: its sounds belong to the old mixer.
+    player: Option<Player>,
+    /// The open device. None while it could not be opened ([`Output::retry_at`] says when to try again).
+    sink: Option<MixerDeviceSink>,
+    /// The stream error tally, kept across reopens.
+    errors: Arc<Mutex<ErrorLog>>,
+    /// Samples pulled at the last look, and when the device last took one.
+    pulled: u64,
+    progress_at: Option<Instant>,
+    /// When to try opening the device again after a failure.
+    retry_at: Instant,
+}
+
+impl Output {
+    /// Opens the default output device (rodio's own settings: the device's default format and about 50 ms of
+    /// buffer) and starts the ring's reader on it.
+    fn open(ring: &Arc<Ring>) -> Output {
+        let mut out = Output { player: None, sink: None, errors: Arc::default(), pulled: 0, progress_at: None, retry_at: Instant::now() };
+        out.connect(ring);
+        out
+    }
+
+    /// Closes the device (if any) and opens it again, leaving the ring's contents for the new stream.
+    fn connect(&mut self, ring: &Arc<Ring>) {
+        self.player = None;
+        self.sink = None;
+        let errors = Arc::clone(&self.errors);
+        let opened = DeviceSinkBuilder::from_default_device().and_then(|b| {
+            b.with_error_callback(move |err: rodio::cpal::StreamError| {
+                if let Ok(mut log) = errors.lock() {
+                    log.count += 1;
+                    log.last = Some(err.to_string());
+                }
+            })
+            .open_sink_or_fallback()
+        });
+        match opened {
+            Ok(mut sink) => {
+                sink.log_on_drop(false);
+                let player = Player::connect_new(sink.mixer());
+                player.append(MixerDecoder { ring: Arc::clone(ring), right: None });
+                self.sink = Some(sink);
+                self.player = Some(player);
+                self.pulled = ring.progress().0;
+                self.progress_at = Some(Instant::now());
+            }
+            Err(e) => {
+                eprintln!("audio: cannot open the default output device ({e}); trying again in {} s", RETRY.as_secs());
+                self.retry_at = Instant::now() + RETRY;
+            }
+        }
+    }
+}
+
+/// The device has taken no sample for `waited` while `queued` frames wait: it is starved, not idle.
+fn stalled(queued: usize, waited: Duration) -> bool { queued > 0 && waited >= STALL }
 
 /// `RC_AUDIO_WAV`: the first 10 s (`RC_AUDIO_WAV_SECONDS`).
 struct WavCapture {
@@ -195,6 +270,8 @@ impl Drop for WavCapture {
 pub struct AudioOut {
     system: AudioSystem,
     ring: Arc<Ring>,
+    /// The device playing the ring ([`Output`], reopened by [`output_watchdog`]).
+    output: Output,
     wav: Option<WavCapture>,
     /// 800-sample frames output so far.
     done: u64,
@@ -296,6 +373,7 @@ impl Plugin for AudioOutPlugin {
     fn build(&self, app: &mut App) {
         let Some(data) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
         let ring = Arc::new(Ring::default());
+        let output = Output::open(&ring);
         let mut system = AudioSystem::new(data);
         let option = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<i32>().ok()).map(|v| v.clamp(0, 0x400));
         let (fixed_music, fixed_sfx) = (option("RC_AUDIO_MUSIC"), option("RC_AUDIO_SFX"));
@@ -312,14 +390,13 @@ impl Plugin for AudioOutPlugin {
             system.spu.reverb.enabled = false;
             println!("audio: RC_REVERB=0: no reverb output");
         }
-        app.add_audio_source::<MixerStream>()
-            .insert_resource(AudioOut { system, ring, wav, done: 0, buf: Vec::new(), last_report: 0, trace, fixed_sfx: fixed_sfx.is_some(), fixed_music: fixed_music.is_some() })
-            .add_systems(Startup, start_output)
+        app.insert_resource(AudioOut { system, ring, output, wav, done: 0, buf: Vec::new(), last_report: 0, trace, fixed_sfx: fixed_sfx.is_some(), fixed_music: fixed_music.is_some() })
             // After the scene frame (which runs before the tick) and the tick, which a running scene suspends.
             .add_systems(FixedUpdate, scene_sound.after(crate::gameplay::GameTick))
             .add_systems(FixedUpdate, sync_underwater.before(crate::gameplay::GameTick))
             .add_systems(FixedUpdate, sync_options.before(crate::gameplay::GameTick))
-            .add_systems(PostUpdate, run_audio);
+            .add_systems(PostUpdate, run_audio)
+            .add_systems(PostUpdate, output_watchdog.after(run_audio));
     }
 }
 
@@ -343,9 +420,30 @@ fn sync_options(mut out: ResMut<AudioOut>, gs: Option<Res<crate::gameplay::Persi
     if s.snd.vm.mono != mono { s.snd.vm.mono = mono; }
 }
 
-fn start_output(mut commands: Commands, out: Res<AudioOut>, mut streams: ResMut<Assets<MixerStream>>) {
-    let handle = streams.add(MixerStream { ring: Arc::clone(&out.ring) });
-    commands.spawn(AudioPlayer(handle));
+/// Keeps the output alive (module docs): reopens the device when it could not be opened, and when it stops taking
+/// samples with frames waiting. cpal 0.17's ALSA worker leaves a stream dead after an xrun the PipeWire ALSA
+/// plugin reports as `POLLERR`, so under CPU load the game would otherwise go silent until restarted.
+fn output_watchdog(mut out: ResMut<AudioOut>) {
+    let now = Instant::now();
+    let AudioOut { ring, output, .. } = &mut *out;
+    let (pulled, queued) = ring.progress();
+    if pulled != output.pulled {
+        output.pulled = pulled;
+        output.progress_at = Some(now);
+        return;
+    }
+    if output.sink.is_none() {
+        if now >= output.retry_at { output.connect(ring); }
+        return;
+    }
+    let waited = now.saturating_duration_since(output.progress_at.unwrap_or(now));
+    if !stalled(queued, waited) { return; }
+    let (errors, last) = output.errors.lock().map(|e| (e.count, e.last.clone())).unwrap_or((0, None));
+    match last {
+        Some(e) => eprintln!("audio: the output device took no sample for {:.1} s with {queued} frames waiting ({errors} stream errors, last: {e}); reopening it", waited.as_secs_f64()),
+        None => eprintln!("audio: the output device took no sample for {:.1} s with {queued} frames waiting; reopening it", waited.as_secs_f64()),
+    }
+    output.connect(ring);
 }
 
 /// The audio frame of a scene frame while the scene suspends the gameplay tick (module docs): the EE frame
@@ -420,5 +518,23 @@ fn run_audio(
             fill,
             if s.snd.unimplemented.is_empty() { String::new() } else { format!(", unported grains {:?}", s.snd.unimplemented) }
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_waited_for_frames_make_a_stall() {
+        // A quiet device with nothing to play is idle, not stalled.
+        assert!(!stalled(0, Duration::ZERO));
+        assert!(!stalled(0, STALL * 10));
+        // Frames waiting but the device still pulling: the prefill pause and a healthy stream.
+        assert!(!stalled(800, Duration::ZERO));
+        assert!(!stalled(800, STALL - Duration::from_millis(1)));
+        // Frames waiting and no sample for STALL: the device is dead.
+        assert!(stalled(800, STALL));
+        assert!(stalled(RING_CAP, STALL * 2));
     }
 }
