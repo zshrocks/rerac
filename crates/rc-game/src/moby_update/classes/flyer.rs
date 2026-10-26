@@ -373,6 +373,8 @@ pub const KILL_BEAM: crate::moby_update::creature::fx::Beam = crate::moby_update
 /// the wreck 1510 (`0x30be70(f, m, P+0xd0 − P+0xe0)`: `classes::burning_wreck`).
 fn kill(w: &mut World, id: MobyId, f: f32) {
     crate::moby_update::story::award_skill_point(w, 0);
+    // The Blarg ships skip `SetDeathBits`; RAC2's multiplier counts their death here.
+    w.creature_killed(id);
     w.mm(id).state = DEAD;
     let pos = crate::moby_update::creature::pos(w, id);
     crate::moby_update::creature::fx::beam_explosion(w, &KILL_BEAM, Some(id), pos);
