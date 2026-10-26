@@ -176,7 +176,10 @@ fn main() -> anyhow::Result<()> {
                     0 => TaskPoolOptions::default(),
                     n => TaskPoolOptions::with_num_threads(n),
                 },
-            }),
+            })
+            // The audio output is ours (crate::audio_out, which reopens the device when the stream dies); bevy_audio
+            // would open a second, silent device.
+            .disable::<bevy::audio::AudioPlugin>(),
     )
     // The game frame every camera renders into and its presentation in the window (before anything spawns a camera,
     // and before the capture, which captures the frame).

@@ -259,11 +259,12 @@ underwater loop at the camera (flags 0x15). 6 `0x31a128` music box (§4).
    - a simple reverb send (the libsd presets are not reversed).
    Voice stealing (proposal, U): take a free voice in the group range, else the lowest-priority, oldest voice
    with priority ≤ the new tone's.
-7. **Output: a raw sample sink, not Bevy's per-sound playback.** Wrap the mixer as one `rodio::Source`
-   played through `bevy_audio`. That adds no dependency and does not change the build profile. Bevy's
-   per-sound API cannot apply per-voice ADSR, pitch modulation, grain timing or 240 Hz parameter updates.
-   Exact SPU mixing is not achievable. Which sounds play, when, at what 989 volume, pan and pitch can match
-   exactly, and that is what the traces check.
+7. **Output: a raw sample sink, not Bevy's per-sound playback.** Wrap the mixer as one `rodio::Source` and play
+   it through rodio's device sink. Bevy's per-sound API cannot apply per-voice ADSR, pitch modulation, grain timing
+   or 240 Hz parameter updates, and `bevy_audio` keeps its `AudioOutput` private, so a stream cpal 0.17 leaves dead
+   after a `POLLERR` underrun could not be reopened (see the engine notes below). Exact SPU mixing is not
+   achievable. Which sounds play, when, at what 989 volume, pan and pitch can match exactly, and that is what the
+   traces check.
 
 ## 7. Unknowns
 - 989snd voice allocation and stealing, stream time units, and the exact SPU2 reverb (not disassembled; the
@@ -355,8 +356,11 @@ first frame, emitters, `sound_update` with the previous frame's replies applied 
 989snd tick every 200 samples. Deterministic: two renders are identical (unit test and engine WAVs).
 
 **Engine.** Bevy 0.19's default features include `audio` (bevy_audio + rodio 0.22 + cpal, already in
-`Cargo.lock`); `audio_out.rs` registers a `Decodable` asset whose decoder reads a ring buffer that the game tick
-fills (50 ms prefill, 0.25 s cap). Listener = the main camera (the follow camera when gameplay runs); hero =
+`Cargo.lock`); `audio_out.rs` appends a `rodio::Source` reading a ring buffer that the game tick fills (50 ms
+prefill, 0.25 s cap) to its own rodio device sink. The sink is ours rather than `bevy_audio`'s (`AudioPlugin` is
+disabled): cpal 0.17's ALSA worker cannot recover from an xrun the PipeWire ALSA plugin reports as `POLLERR`, so
+a CPU-stressed 50 ms buffer kills the stream for good, and a watchdog reopens the device when it stops taking
+samples with frames waiting. Listener = the main camera (the follow camera when gameplay runs); hero =
 Ratchet's 0x13f3d0 from crate::gameplay, else the camera. `RC_AUDIO=0`, `RC_AUDIO_WAV=path` (10 s WAV),
 `RC_AUDIO_MUSIC` / `RC_AUDIO_SFX` (option volumes 0..1024; defaults 716 / 1024 from the boot data).
 The underwater flag was wired on 2026-09-28 (below).

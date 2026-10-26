@@ -4393,6 +4393,7 @@ dependencies = [
  "rc-game",
  "rc-game2",
  "rc-video",
+ "rodio",
 ]
 
 [[package]]
